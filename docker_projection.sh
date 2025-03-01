@@ -1,7 +1,7 @@
 function run_docker_wk() {
    
     # 镜像名称和版本
-    IMAGE_NAME="dev_aznas"
+    IMAGE_NAME="zico_swap_image:v1.0"
 
     # 容器名称（可选）
     CONTAINER_NAME="dev_aznas_container2"

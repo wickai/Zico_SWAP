@@ -106,3 +106,6 @@ venv.bak/
 ## custom
 *.pth.tar
 *.pth
+
+# save_dir/
+save_dir/
