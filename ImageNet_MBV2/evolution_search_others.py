@@ -17,7 +17,7 @@ import PlainNet
 from xautodl import datasets
 import time
 
-from ZeroShotProxy import compute_zen_score, compute_te_nas_score, compute_syncflow_score, compute_gradnorm_score, compute_NASWOT_score, compute_zico
+from ZeroShotProxy import compute_zen_score, compute_te_nas_score, compute_syncflow_score, compute_gradnorm_score, compute_NASWOT_score, compute_zico, compute_swap
 import benchmark_network_latency
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
@@ -124,6 +124,17 @@ def compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainloader=
     
     if args.zero_shot_score.lower() == 'zico':
         the_nas_core = compute_zico.getzico(the_model, trainloader,lossfunc)
+    
+    elif args.zero_shot_score.lower() == 'swap':
+        the_nas_core = compute_swap.compute_swap_score(
+            model=the_model,
+            batch_size=args.batch_size,
+            resolution=args.input_image_size,
+            gpu=0,
+            regular=True,
+            mu=100000,
+            sigma=500
+        )
 
     elif args.zero_shot_score == 'Zen':
         the_nas_core_info = compute_zen_score.compute_nas_score(model=the_model, gpu=gpu,

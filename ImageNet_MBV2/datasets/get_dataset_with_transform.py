@@ -209,7 +209,7 @@ def get_datasets(name, root, cutout):
         assert len(train_data) == 50000 and len(test_data) == 10000
     elif name.startswith("imagenet-1k"):
         train_data = dset.ImageFolder(osp.join(root, "train"), train_transform)
-        test_data = dset.ImageFolder(osp.join(root, "val"), test_transform)
+        test_data = dset.ImageFolder(osp.join(root, "val_new"), test_transform)
         assert (
             len(train_data) == 1281167 and len(test_data) == 50000
         ), "invalid number of images : {:} & {:} vs {:} & {:}".format(
