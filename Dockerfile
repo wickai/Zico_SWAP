@@ -33,7 +33,6 @@ RUN pip install matplotlib
 
 RUN pip install jupyter "numpy<2" scipy ipython pandas easydict opencv-python "tensorflow==2.10.0" torchsummary tensorboard
 RUN pip install horovod[pytorch] ptflops timm thop einops graphviz
-RUN pip install torch
 RUN apt-get install -y xdg-utils
 
 #CleanUp

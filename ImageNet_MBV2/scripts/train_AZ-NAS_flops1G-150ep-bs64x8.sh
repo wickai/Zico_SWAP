@@ -39,7 +39,7 @@ python analyze_model.py \
   --arch Masternet.py:MasterNet \
   --plainnet_struct_txt ${save_dir}/best_structure.txt
 
-horovodrun -np 8 python train_image_classification.py --dataset imagenet --num_classes 1000 \
+horovodrun -np 1 python train_image_classification.py --dataset imagenet --num_classes 1000 \
   --dist_mode single --workers_per_gpu ${num_workers} \
   --input_image_size ${resolution} --epochs ${epochs} --warmup 5 \
   --optimizer sgd --bn_momentum 0.01 --wd 4e-5 --nesterov --weight_init ${init} \
@@ -50,5 +50,5 @@ horovodrun -np 8 python train_image_classification.py --dataset imagenet --num_c
   --use_se \
   --target_downsample_ratio 16 \
   --batch_size_per_gpu 64 --save_dir ${save_dir}/plain_training_epochs${epochs}_init-${init} \
-  --world-size 8 \
+  --world-size 1 \
   --dist_mode horovod\
