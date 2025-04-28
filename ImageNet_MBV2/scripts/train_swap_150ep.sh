@@ -16,7 +16,7 @@ set -e
 # 	exit 1
 # fi
 
-metric=AZ_NAS
+metric=swap
 population_size=1024
 evolution_max_iter=1e5
 seed=123

@@ -26,7 +26,7 @@ echo "Run this script with search_gpu=$gpu, seed=$seed"
 
 cd ../
 
-save_dir=./save_dir/${metric}_flops450M-searchbs64-pop${population_size}-iter${evolution_max_iter}-${seed}
+save_dir=./save_dir/${metric}_flops450M-searchbs64-pop${population_size}-iter${evolution_max_iter}-${seed}_28thApril
 mkdir -p ${save_dir}
 evolution_max_iter=$(printf "%.0f" $evolution_max_iter)
 
@@ -37,10 +37,10 @@ max_layers=14
 epochs=150
 # evolution_max_iter=100000
 
-echo "SuperConvK3BNRELU(3,760,2,1)SuperResIDWE1K3(760,32,2,8,3)
-SuperResIDWE4K3(32,24,1,8,2)SuperResIDWE6K3(24,16,2,32,1)
-SuperResIDWE1K7(16,144,2,24,1)SuperResIDWE1K3(144,16,2,32,3)
-SuperConvK1BNRELU(16,2048,1,1)" > ${save_dir}/init_plainnet.txt
+echo "SuperConvK3BNRELU(3,8,2,1)SuperResIDWE6K3(8,32,2,8,1)SuperResIDWE6K3(32,48,2,32,1)\
+SuperResIDWE6K3(48,96,2,48,1)SuperResIDWE6K3(96,128,2,96,1)\
+SuperConvK1BNRELU(128,2048,1,1)" > ${save_dir}/init_plainnet.txt
+
 
 python evolution_search_others.py --gpu ${gpu} \
   --zero_shot_score ${metric} \

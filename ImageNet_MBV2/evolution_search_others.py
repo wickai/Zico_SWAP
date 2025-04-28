@@ -22,6 +22,11 @@ import benchmark_network_latency
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
+def none_or_int(value):
+    if value.lower() == 'none':
+        return None
+    return int(value)
+
 def parse_cmd_options(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', type=int, default=None)
@@ -53,6 +58,7 @@ def parse_cmd_options(argv):
                         help='root of path')
     parser.add_argument('--maxbatch', type=int, default=2,
                         help='root of path')
+    parser.add_argument('--seed', type=none_or_int, default=None)    
                         
     module_opt, _ = parser.parse_known_args(argv)
     return module_opt
@@ -116,7 +122,27 @@ def get_latency(AnyPlainNet, random_structure_str, gpu, args):
     torch.cuda.empty_cache()
     return the_latency
 
-def compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainloader=None, lossfunc=None):
+#for swap, use 1 batch imagenet as input
+
+import torchvision
+from torchvision import transforms
+# 定义 ImageNet 的预处理
+imagenet_transforms = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                         std=[0.229, 0.224, 0.225]),
+])
+
+# 加载 ImageNet 数据集
+imagenet_dataset = torchvision.datasets.ImageFolder('/home/ubuntu/scratch/kaiwei/unzip_imagenet/ILSVRC/Data/CLS-LOC/val_new', transform=imagenet_transforms)
+dataloader = torch.utils.data.DataLoader(imagenet_dataset, batch_size=32, shuffle=False)
+
+# 获取一个 batch 的数据
+swap_inputs, _ = next(iter(dataloader))
+
+def compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainloader=None, lossfunc=None, population_models=None):
     # compute network zero-shot proxy score
     the_model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=random_structure_str,
                             no_create=False, no_reslink=True)
@@ -126,16 +152,21 @@ def compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainloader=
         the_nas_core = compute_zico.getzico(the_model, trainloader,lossfunc)
     
     elif args.zero_shot_score.lower() == 'swap':
-        the_nas_core = compute_swap.compute_swap_score(
-            model=the_model,
-            batch_size=args.batch_size,
-            resolution=args.input_image_size,
-            gpu=0,
-            regular=True,
-            mu=100000,
-            sigma=500
-        )
-
+        if population_models:
+            the_nas_core = compute_swap.compute_swap_score(
+                gpu=gpu,
+                model=the_model,
+                inputs=swap_inputs,
+                regular=True,
+                model_list=population_models
+            )
+        else:
+            the_nas_core = compute_swap.compute_swap_score(
+                gpu=gpu,
+                model=the_model,
+                inputs=swap_inputs,
+                regular=False
+            )
     elif args.zero_shot_score == 'Zen':
         the_nas_core_info = compute_zen_score.compute_nas_score(model=the_model, gpu=gpu,
                                                                 resolution=args.input_image_size,
@@ -219,9 +250,10 @@ def main(args, argv):
         trainbatches.append([datax, datay])
         
     best_structure_txt = os.path.join(args.save_dir, 'best_structure.txt')
-    if os.path.isfile(best_structure_txt):
-        print('skip ' + best_structure_txt)
-        return None
+    # disable skip to always rerun SWAP
+    # if os.path.isfile(best_structure_txt):
+    #     print('skip ' + best_structure_txt)
+    #     return None
 
     # load search space config .py file
     select_search_space = global_utils.load_py_module_from_path(args.search_space)
@@ -305,8 +337,27 @@ def main(args, argv):
             logging.info(f'loop_count={loop_count}/{args.evolution_max_iter}, max_score={max_score:4g}, min_score={min_score:4g}, running_time={elasp_time/3600:4g}h, search_time={search_time/3600:4g}h')
         
         search_time_start = time.time()
-        the_nas_core = compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainbatches, lossfunc)
+        
+        # 如果是SWAP评分，则从当前种群中收集模型
+        if args.zero_shot_score.lower() == 'swap' and popu_structure_list:
+            population_models = []
+            for struct in popu_structure_list:
+                model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=struct,
+                                   no_create=False, no_reslink=True)
+                population_models.append(model)
+        else:
+            population_models = None
+            
+        the_nas_core = compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainbatches, lossfunc,
+                                        population_models=population_models)
         search_time_list.append(time.time() - search_time_start)
+        
+        # 清理种群模型的内存
+        if population_models:
+            for model in population_models:
+                del model
+            population_models = None
+            torch.cuda.empty_cache()
 
         popu_structure_list.append(random_structure_str)
         popu_zero_shot_score_list.append(the_nas_core)
@@ -326,6 +377,17 @@ if __name__ == '__main__':
     log_fn = os.path.join(args.save_dir, 'evolution_search.log')
     global_utils.create_logging(log_fn)
 
+    if args.seed is not None:
+        logging.info("The seed number is set to {}".format(args.seed))
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic=True
+        torch.backends.cudnn.benchmark = False
+        os.environ["PYTHONHASHSEED"] = str(args.seed)
+        
     info = main(args, sys.argv)
     if info is None:
         exit()

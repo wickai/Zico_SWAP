@@ -1,112 +1,106 @@
+import numpy as np
 import torch
-from torch import nn
-import math
-from PlainNet.basic_blocks import RELU
-def count_parameters_in_MB(model: nn.Module):
-    """
-    计算模型参数量（单位：MB）
-    """
-    # 这里为了示例，只简单返回 float 类型数值，可以根据你的项目需求进行调整
-    num_params = 0
-    for p in model.parameters():
-        num_params += p.numel()
-    return num_params * 4 / (1024.0 * 1024.0)  # 假设float32，每个param占4 bytes
+import torch.nn as nn
+
+
+def count_parameters_in_MB(model):
+  return np.sum(np.prod(v.size()) for name, v in model.named_parameters() if "auxiliary" not in name)/1e6
 
 def cal_regular_factor(model, mu, sigma):
-    
-    param_mb = count_parameters_in_MB(model)
-    param_kb = param_mb * 1e3
-    print("param_mb, mu, sigma =", param_mb, mu, sigma)
-    val = -((param_kb - mu) ** 2) / (2*sigma**2)  
-    return math.exp(val)
+    model_params = torch.as_tensor(count_parameters_in_MB(model)*1e3)
+    regular_factor =  torch.exp(-(torch.pow((model_params-mu),2)/sigma))
+    return regular_factor
 
-
-class SampleWiseActivationPatterns:
-    """
-    收集所有 ReLU 的特征 sign()，然后求 unique 模式数量
-    """
+class SampleWiseActivationPatterns(object):
     def __init__(self, device):
-        self.device = device
+        self.swap = -1 
         self.activations = None
+        self.device = device
 
     @torch.no_grad()
-    def collect_activations(self, feats):
-        self.activations = feats.sign().to(self.device)
+    def collect_activations(self, activations):
+        n_sample = activations.size()[0]
+        n_neuron = activations.size()[1]
 
-    @torch.no_grad()
-    def calc_swap(self, reg_factor=1.0):
         if self.activations is None:
-            return 0
-        # shape: (N, sum_of_features)
-        # 转置后，每一行代表一个feature，每一列代表一个样本
-        self.activations = self.activations.t()
-        unique_patterns = torch.unique(self.activations, dim=0).size(0)
-        print("unique_patterns * reg_factor:", unique_patterns, reg_factor)
-        return unique_patterns #* reg_factor
+            self.activations = torch.zeros(n_sample, n_neuron).to(self.device)  
+
+        self.activations = torch.sign(activations)
+
+    @torch.no_grad()
+    def calSWAP(self, regular_factor):
+        self.activations = self.activations.T  # transpose the activation matrix: (samples, neurons) to (neurons, samples)
+        self.swap = torch.unique(self.activations, dim=0).size(0)
+        
+        del self.activations
+        self.activations = None
+        torch.cuda.empty_cache()
+
+        return self.swap * regular_factor
 
 
 class SWAP:
-    """
-    SWAP 结合参数量正则
-
-    使用方法：
-        1. 初始化 SWAP 实例:
-            swap_evaluator = SWAP(device, regular=True, mu=..., sigma=...)
-        2. 调用 evaluate:
-            swap_score = swap_evaluator.evaluate(model, inputs)
-    """
-    def __init__(self, device, regular=False, mu=None, sigma=None):
-        self.device = device
+    def __init__(self, model=None, inputs=None, device='cpu', seed=0, regular=True, mu=None, sigma=None):
+        self.model = model
+        self.interFeature = []
+        self.seed = seed
         self.regular = regular
+        self.regular_factor = 1
         self.mu = mu
         self.sigma = sigma
-        self.inter_feats = []
-        self.swap_evaluator = SampleWiseActivationPatterns(device)
+        self.inputs = inputs
+        self.device = device
+        self.reinit(self.model, self.seed)
 
-    def evaluate(self, model, inputs):
-        """
-        给定模型和输入样本，计算SWAP分数.
+    def reinit(self, model=None, seed=None):
+        if model is not None:
+            self.model = model
+            self.register_hook(self.model)
+            self.swap = SampleWiseActivationPatterns(self.device)
+            if self.regular and self.mu is not None and self.sigma is not None:
+                self.regular_factor = cal_regular_factor(self.model, self.mu, self.sigma).item()
+ 
+        if seed is not None and seed != self.seed:
+            self.seed = seed
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+        del self.interFeature
+        self.interFeature = []
+        torch.cuda.empty_cache()
 
-        参数:
-            model: PyTorch 模型
-            inputs: 一个 batch 的输入数据，tensor
-        返回:
-            SWAP 分数 (float)
-        """
-        # 如果启用了参数量正则
-        if self.regular and (self.mu is not None) and (self.sigma is not None):
-            reg_factor = cal_regular_factor(model, self.mu, self.sigma)
-        else:
-            reg_factor = 1.0
+    def clear(self):
+        self.swap = SampleWiseActivationPatterns(self.device)
+        del self.interFeature
+        self.interFeature = []
+        torch.cuda.empty_cache()
 
-        # 注册 hook 收集 ReLU 输出
-        hooks = []
-        for name, module in model.named_modules():
-            if isinstance(module, RELU):
-                h = module.register_forward_hook(self._hook_fn)
-                hooks.append(h)
-        print(hooks)
-        self.inter_feats = []
-        model.eval()
+    def register_hook(self, model):
+        for n, m in model.named_modules():
+            if isinstance(m, nn.ReLU):
+                m.register_forward_hook(hook=self.hook_in_forward)
+
+    def hook_in_forward(self, module, input, output):
+        if isinstance(input, tuple) and len(input[0].size()) == 4:
+            self.interFeature.append(output.detach()) 
+
+    def forward(self):
+        self.interFeature = []
         with torch.no_grad():
-            model(inputs.to(self.device))
-
-        if len(self.inter_feats) == 0:
-            self._clear_hooks(hooks)
-            return 0
-
-        # 拼接所有中间特征： shape (N, sum_of_features)
-        all_feats = torch.cat(self.inter_feats, dim=1)
-        print("all_feats", all_feats)
-        self.swap_evaluator.collect_activations(all_feats)
-        
-        swap_score = self.swap_evaluator.calc_swap(reg_factor)
-        self._clear_hooks(hooks)
-        self.inter_feats = []
-        return swap_score
+            self.model.forward(self.inputs.to(self.device))
+            if len(self.interFeature) == 0: return
+            activtions = torch.cat([f.view(self.inputs.size(0), -1) for f in self.interFeature], 1)         
+            self.swap.collect_activations(activtions)
+            
+            return self.swap.calSWAP(self.regular_factor)
 
     def _hook_fn(self, module, inp, out):
-        print(f"Hook triggered for module: {module}")
+        """Forward hook函数，用于收集ReLU层的输出特征
+        
+        Args:
+            module: PyTorch模块
+            inp: 输入张量
+            out: 输出张量
+        """
         # out: shape (N, C, H, W) --> reshape to (N, -1)
         feats = out.detach().reshape(out.size(0), -1)
         self.inter_feats.append(feats)
@@ -117,25 +111,59 @@ class SWAP:
         hooks.clear()
 
 
-def compute_swap_score(gpu, model, resolution, batch_size,
-                       regular=False, mu=None, sigma=None):
+def compute_params_stats(model_list, top_k=100):
+    """计算模型参数量的统计信息
+    
+    Args:
+        model_list: 模型列表
+        top_k: 使用前k个模型来计算统计信息
+    
+    Returns:
+        tuple: (mu, sigma) mu为参数量均值（KB），sigma为标准差（KB）
+    """
+    if not model_list:
+        raise ValueError("model_list cannot be empty")
+    
+    # 取前k个模型
+    models = model_list[:min(top_k, len(model_list))]
+    
+    # 计算每个模型的参数量（KB）
+    param_sizes = [count_parameters_in_MB(model) * 1024 for model in models]  # 转换为KB
+    
+    # 计算均值和标准差
+    mu = sum(param_sizes) / len(param_sizes)
+    sigma = (sum((x - mu) ** 2 for x in param_sizes) / len(param_sizes)) ** 0.5
+    
+    return mu, sigma
 
+def compute_swap_score(gpu, model, inputs, regular=False, mu=None, sigma=None, model_list=None):
+    """计算SWAP分数
+    
+    Args:
+        gpu: GPU设备号，如果使用CPU则为None
+        model: 要计算的模型
+        inputs: 输入数据
+        regular: 是否使用参数量正则化
+        mu: 目标参数量均值（KB），如果为None且regular=True则从 model_list 计算
+        sigma: 参数量标准差（KB），如果为None且regular=True则从 model_list 计算
+        model_list: 用于计算mu和sigma的模型列表
+    
+    Returns:
+        float: SWAP分数
+    """
+    # 如果需要正则化但没有提供mu和sigma，尝试从 model_list 计算
+    if regular and (mu is None or sigma is None):
+        if model_list is None:
+            raise ValueError("When regular=True and mu/sigma not provided, model_list must be provided")
+        mu, sigma = compute_params_stats(model_list)
+    
     # 将模型放到指定GPU(如果gpu is not None)
     if gpu is not None:
         torch.cuda.set_device(gpu)
         model = model.cuda(gpu)
-
-    # 随机生成一个 batch 的输入
-    # 与其他零成本指标一致，这里用随机输入即可
-    inputs = torch.randn(size=[batch_size, 3, resolution, resolution])
     device = torch.device(f'cuda:{gpu}' if gpu is not None else 'cpu')
     inputs = inputs.to(device)
-    print("inputs", inputs)
-
-    # 初始化一个SWAP对象
-    swap_evaluator = SWAP(device=device, regular=regular, mu=mu, sigma=sigma)
-
-    # 计算SWAP score
-    swap_score = swap_evaluator.evaluate(model, inputs)
-    print("swap_score", swap_score)
-    return float(swap_score)
+    
+    swap_evaluator = SWAP(model=model, inputs=inputs, device=device, regular=regular, mu=mu, sigma=sigma)
+    swap_score = swap_evaluator.forward()
+    return float(swap_score) if swap_score is not None else 0.0
