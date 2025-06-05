@@ -109,3 +109,6 @@ venv.bak/
 
 # save_dir/
 save_dir/
+
+# data
+**/data/

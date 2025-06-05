@@ -16,7 +16,7 @@ set -e
 # 	exit 1
 # fi
 
-metric=AZ_NAS
+metric=swap
 population_size=200
 evolution_max_iter=5000
 seed=123
@@ -26,7 +26,7 @@ echo "Run this script with metric=$metric, population_size=$population_size, evo
 
 cd ../
 
-save_dir=./save_dir/${metric}_flops450M-searchbs64-pop${population_size}-iter${evolution_max_iter}-${seed}_2ndMay_CIFAR10
+save_dir=./save_dir/${metric}_flops450M-searchbs64-pop${population_size}-iter${evolution_max_iter}-${seed}_28thApril_CIFAR10
 mkdir -p ${save_dir}
 evolution_max_iter=$(printf "%.0f" $evolution_max_iter)
 
@@ -38,7 +38,6 @@ python analyze_model.py \
   --num_classes 10 \
   --arch Masternet.py:MasterNet \
   --plainnet_struct_txt ${save_dir}/best_structure.txt
-
 
 # CIFAR-10适用的训练参数
 horovodrun -np 1 python train_image_classification.py --dataset cifar10 --num_classes 10 \
@@ -53,4 +52,5 @@ horovodrun -np 1 python train_image_classification.py --dataset cifar10 --num_cl
   --target_downsample_ratio 8 \
   --batch_size_per_gpu 128 --save_dir ${save_dir}/plain_training_epochs${epochs}_init-${init} \
   --datapath ./data
+
 

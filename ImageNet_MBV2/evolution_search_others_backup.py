@@ -2,6 +2,7 @@
 Copyright (C) 2010-2021 Alibaba Group Holding Limited.
 '''
 
+
 import os, sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -57,13 +58,7 @@ def parse_cmd_options(argv):
                         help='root of path')
     parser.add_argument('--maxbatch', type=int, default=2,
                         help='root of path')
-    parser.add_argument('--swap_batch_size', type=int, default=16,
-                        help='batch size for SWAP scoring')
-    parser.add_argument('--rand_input', action='store_true',
-                        help='use random input for SWAP scoring')
-    parser.add_argument('--seed', type=none_or_int, default=None)
-    parser.add_argument('--precompute_models', type=int, default=500,
-                        help='number of models to precompute statistics for SWAP regularization')
+    parser.add_argument('--seed', type=none_or_int, default=None)    
                         
     module_opt, _ = parser.parse_known_args(argv)
     return module_opt
@@ -117,8 +112,7 @@ def get_splitted_structure_str(AnyPlainNet, structure_str, num_classes):
 def get_latency(AnyPlainNet, random_structure_str, gpu, args):
     the_model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=random_structure_str,
                             no_create=False, no_reslink=False)
-    # move model to GPU if available
-    if gpu is not None and torch.cuda.is_available():
+    if gpu is not None:
         the_model = the_model.cuda(gpu)
     the_latency = benchmark_network_latency.get_model_latency(model=the_model, batch_size=args.batch_size,
                                                               resolution=args.input_image_size,
@@ -128,39 +122,49 @@ def get_latency(AnyPlainNet, random_structure_str, gpu, args):
     torch.cuda.empty_cache()
     return the_latency
 
+#for swap, use 1 batch imagenet as input
+
+import torchvision
+from torchvision import transforms
+# 定义 ImageNet 的预处理
+imagenet_transforms = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                         std=[0.229, 0.224, 0.225]),
+])
+
+# 加载 ImageNet 数据集
+imagenet_dataset = torchvision.datasets.ImageFolder('/home/ubuntu/scratch/kaiwei/unzip_imagenet/ILSVRC/Data/CLS-LOC/val_new', transform=imagenet_transforms)
+dataloader = torch.utils.data.DataLoader(imagenet_dataset, batch_size=32, shuffle=False)
+
+# 获取一个 batch 的数据
+swap_inputs, _ = next(iter(dataloader))
+
 def compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainloader=None, lossfunc=None, population_models=None):
     # compute network zero-shot proxy score
     the_model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=random_structure_str,
                             no_create=False, no_reslink=True)
-    # move model to GPU if available
-    if gpu is not None and torch.cuda.is_available():
-        the_model = the_model.cuda(gpu)
+    the_model = the_model.cuda(gpu)
     
     if args.zero_shot_score.lower() == 'zico':
         the_nas_core = compute_zico.getzico(the_model, trainloader,lossfunc)
+    
     elif args.zero_shot_score.lower() == 'swap':
-        # use preloaded swap_inputs (cached on GPU) for SWAP scoring
-        inputs = swap_inputs
-        print(f"\nComputing SWAP score for model")
-        print(f"Model size: {the_model.get_model_size()} MB")
-        print(f"Model FLOPs: {the_model.get_FLOPs(args.input_image_size)}")
-        
-        # 使用全局预先计算的统计信息，不再需要从种群中收集模型
-        the_nas_core = compute_swap.compute_swap_score(
-            gpu=gpu,
-            model=the_model,
-            inputs=inputs,
-            regular=True,  # 始终使用正则化
-            use_global_stats=True  # 使用全局预先计算的统计信息
-        )
-        
-        # 如果SWAP分数为0，尝试不使用正则化
-        if the_nas_core == 0:
-            print("SWAP score is 0 with regularization, trying without regularization")
+        if population_models:
             the_nas_core = compute_swap.compute_swap_score(
                 gpu=gpu,
                 model=the_model,
-                inputs=inputs,
+                inputs=swap_inputs,
+                regular=True,
+                model_list=population_models
+            )
+        else:
+            the_nas_core = compute_swap.compute_swap_score(
+                gpu=gpu,
+                model=the_model,
+                inputs=swap_inputs,
                 regular=False
             )
     elif args.zero_shot_score == 'Zen':
@@ -232,29 +236,17 @@ def getmisc(args):
 def main(args, argv):
 
     gpu = args.gpu
-    # setup device
-    if gpu is not None and torch.cuda.is_available():
-        device_count = torch.cuda.device_count()
-        print(f"Detected {device_count} CUDA device(s), using GPU {gpu}")
-        torch.cuda.set_device(gpu)
+    if gpu is not None:
+        print(torch.cuda.device_count())
+        torch.cuda.set_device('cuda:{}'.format(gpu))
         torch.backends.cudnn.benchmark = True
-    else:
-        if gpu is not None:
-            print("CUDA not available, falling back to CPU")
-        else:
-            print("Running on CPU")
     print(args)
     trainloader, testloader, xshape, class_num = getmisc(args)
     trainbatches = []
     for batchid, batch in enumerate(trainloader):
         if batchid == args.maxbatch:
             break
-        # move batch to device if CUDA available
-        if gpu is not None and torch.cuda.is_available():
-            datax = batch[0].cuda(gpu)
-            datay = batch[1].cuda(gpu)
-        else:
-            datax, datay = batch[0], batch[1]
+        datax, datay = batch[0].cuda(), batch[1].cuda()
         trainbatches.append([datax, datay])
         
     best_structure_txt = os.path.join(args.save_dir, 'best_structure.txt')
@@ -276,113 +268,6 @@ def main(args, argv):
     popu_zero_shot_score_list = []
     popu_latency_list = []
     search_time_list = []
-    
-    # 准备SWAP输入
-    global swap_inputs
-    if args.zero_shot_score.lower() == 'swap':
-        if args.rand_input:
-            swap_inputs = torch.randn(args.swap_batch_size, 3, args.input_image_size, args.input_image_size)
-            if gpu is not None and torch.cuda.is_available():
-                swap_inputs = swap_inputs.cuda(gpu)
-        else:
-            swap_inputs = trainbatches[0][0][:args.swap_batch_size]
-
-    # 预先生成一批模型并计算统计信息
-    if args.zero_shot_score.lower() == 'swap' and args.precompute_models > 0:
-        print(f"\n开始预先生成 {args.precompute_models} 个模型并计算参数统计信息...")
-        precompute_models = []
-        precompute_structures = []
-        
-        # 生成指定数量的随机模型结构
-        for i in range(min(args.precompute_models * 2, 2000)):  # 尝试生成更多模型，因为有些可能不符合约束
-            if i % 50 == 0:
-                print(f"正在生成第 {i+1}/{min(args.precompute_models * 2, 2000)} 个模型...")
-            
-            # 生成随机结构
-            random_structure_str = get_new_random_structure_str(
-                AnyPlainNet=AnyPlainNet, structure_str=initial_structure_str, num_classes=args.num_classes,
-                get_search_space_func=select_search_space.gen_search_space, num_replaces=1)
-            
-            random_structure_str = get_splitted_structure_str(AnyPlainNet, random_structure_str,
-                                                          num_classes=args.num_classes)
-            
-            # 检查模型是否符合预算约束
-            try:
-                the_model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=random_structure_str,
-                                      no_create=True, no_reslink=False)
-                
-                # 检查层数约束
-                if args.max_layers is not None:
-                    the_layers = the_model.get_num_layers()
-                    if args.max_layers < the_layers:
-                        continue
-                
-                # 检查模型大小约束
-                if args.budget_model_size is not None:
-                    the_model_size = the_model.get_model_size()
-                    if args.budget_model_size < the_model_size:
-                        continue
-                
-                # 检查FLOPs约束
-                if args.budget_flops is not None:
-                    the_model_flops = the_model.get_FLOPs(args.input_image_size)
-                    if args.budget_flops < the_model_flops:
-                        continue
-                
-                # 创建实际模型
-                the_model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=random_structure_str,
-                                      no_create=False, no_reslink=True)
-                
-                # 如果模型有效，添加到列表中
-                precompute_models.append(the_model)
-                precompute_structures.append(random_structure_str)
-                
-                # 打印进度
-                if len(precompute_models) % 50 == 0:
-                    print(f"已成功生成 {len(precompute_models)}/{args.precompute_models} 个有效模型")
-                
-                # 如果已经收集了足够的模型，就停止
-                if len(precompute_models) >= args.precompute_models:
-                    break
-                    
-            except Exception as e:
-                print(f"生成模型时出错: {e}")
-                continue
-        
-        # 预先计算参数统计信息
-        print(f"\n开始计算 {len(precompute_models)} 个模型的参数统计信息...")
-        mu, sigma = compute_swap.precompute_params_stats(precompute_models, top_k=len(precompute_models))
-        
-        # 将预计算的模型添加到种群中
-        popu_structure_list.extend(precompute_structures)
-        
-        # 为预计算的模型计算SWAP分数
-        print("\n为预计算的模型计算SWAP分数...")
-        
-        for i, model in enumerate(precompute_models):
-            if i % 50 == 0:
-                print(f"计算第 {i+1}/{len(precompute_models)} 个模型的SWAP分数...")
-            
-            the_nas_core = compute_swap.compute_swap_score(
-                gpu=gpu,
-                model=model,
-                inputs=swap_inputs,
-                regular=True,
-                mu=mu,
-                sigma=sigma,
-                use_global_stats=True
-            )
-            
-            popu_zero_shot_score_list.append(the_nas_core)
-            popu_latency_list.append(np.inf)  # 暂时不计算延迟
-        
-        # 清理内存
-        for model in precompute_models:
-            del model
-        precompute_models = None
-        torch.cuda.empty_cache()
-        
-        print(f"\n预计算完成! 已添加 {len(precompute_structures)} 个模型到初始种群。")
 
     start_timer = time.time()
     lossfunc = nn.CrossEntropyLoss().cuda()
@@ -453,10 +338,26 @@ def main(args, argv):
         
         search_time_start = time.time()
         
-        # 使用预先计算的统计信息进行SWAP评分，不再需要收集种群模型
+        # 如果是SWAP评分，则从当前种群中收集模型
+        if args.zero_shot_score.lower() == 'swap' and popu_structure_list:
+            population_models = []
+            for struct in popu_structure_list:
+                model = AnyPlainNet(num_classes=args.num_classes, plainnet_struct=struct,
+                                   no_create=False, no_reslink=True)
+                population_models.append(model)
+        else:
+            population_models = None
+            
         the_nas_core = compute_nas_score(AnyPlainNet, random_structure_str, gpu, args, trainbatches, lossfunc,
-                                       population_models=None)
+                                        population_models=population_models)
         search_time_list.append(time.time() - search_time_start)
+        
+        # 清理种群模型的内存
+        if population_models:
+            for model in population_models:
+                del model
+            population_models = None
+            torch.cuda.empty_cache()
 
         popu_structure_list.append(random_structure_str)
         popu_zero_shot_score_list.append(the_nas_core)
@@ -475,59 +376,7 @@ if __name__ == '__main__':
     args = parse_cmd_options(sys.argv)
     log_fn = os.path.join(args.save_dir, 'evolution_search.log')
     global_utils.create_logging(log_fn)
-    
-    # Print configuration information
-    print("\n==== Evolution Search Configuration ====\n")
-    print(f"Zero-shot score: {args.zero_shot_score}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Input image size: {args.input_image_size}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"SWAP batch size: {args.swap_batch_size}")
-    print(f"Budget FLOPs: {args.budget_flops}")
-    print(f"Population size: {args.population_size}")
-    print(f"Evolution max iterations: {args.evolution_max_iter}")
-    print(f"GPU: {args.gpu}")
-    print(f"Seed: {args.seed}")
-    print("\n======================================\n")
-    # prepare swap inputs for SWAP scoring
-    import torchvision
-    from torchvision import transforms
-    if args.dataset.lower() == 'cifar10':
-        swap_transform = transforms.Compose([
-            transforms.Resize(args.input_image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4914,0.4822,0.4465], std=[0.2023,0.1994,0.2010]),
-        ])
-        swap_dataset = torchvision.datasets.CIFAR10(root=args.datapath, train=False, download=True, transform=swap_transform)
-    else:
-        swap_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
-        ])
-        swap_dataset = torchvision.datasets.ImageFolder(args.datapath, transform=swap_transform)
-    dataloader = torch.utils.data.DataLoader(swap_dataset, batch_size=args.swap_batch_size, shuffle=False, num_workers=args.num_worker)
-    swap_inputs, _ = next(iter(dataloader))
-    # use only a small subset for SWAP
-    swap_inputs = swap_inputs[:args.swap_batch_size]
-    # move swap_inputs to GPU and cache
-    if args.gpu is not None:
-        swap_inputs = swap_inputs.cuda(args.gpu)
-    print(f"SWAP inputs shape: {swap_inputs.shape}, device: {swap_inputs.device}")
-    
-    # Check for NaN or Inf values in inputs
-    if torch.isnan(swap_inputs).any() or torch.isinf(swap_inputs).any():
-        print("WARNING: NaN or Inf values detected in swap_inputs, fixing...")
-        swap_inputs = torch.nan_to_num(swap_inputs, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    # override with random once if requested
-    if args.rand_input:
-        print("Using random inputs for SWAP scoring")
-        swap_inputs = torch.randn(args.batch_size, 3, args.input_image_size, args.input_image_size)
-        if args.gpu is not None:
-            swap_inputs = swap_inputs.cuda(args.gpu)
-    # set random seed and logging
+
     if args.seed is not None:
         logging.info("The seed number is set to {}".format(args.seed))
         random.seed(args.seed)
@@ -538,15 +387,6 @@ if __name__ == '__main__':
         torch.backends.cudnn.deterministic=True
         torch.backends.cudnn.benchmark = False
         os.environ["PYTHONHASHSEED"] = str(args.seed)
-        
-    # Print CUDA information
-    if torch.cuda.is_available():
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        print(f"CUDA device count: {torch.cuda.device_count()}")
-        print(f"CUDA current device: {torch.cuda.current_device()}")
-        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
-        print(f"CUDA memory reserved: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
         
     info = main(args, sys.argv)
     if info is None:

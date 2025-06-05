@@ -2,3 +2,4 @@ tmp/
 backup/
 save_dir/
 save_dir2/
+scripts/test_relu.log

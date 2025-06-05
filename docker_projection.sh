@@ -4,7 +4,7 @@ function run_docker_wk() {
     IMAGE_NAME="zico_swap_image:v1.0"
 
     # 容器名称（可选）
-    CONTAINER_NAME="dev_aznas_container2"
+    CONTAINER_NAME="dev_aznas_container_search"
 
 
     # 检查 Docker 镜像是否存在
@@ -15,7 +15,7 @@ function run_docker_wk() {
 
     # 运行 Docker 容器
     sudo docker run -dit \
-        --gpus all \
+        --gpus all --shm-size=8g\
         -v "/home/ubuntu/scratch:/home/ubuntu/scratch" \
         -w /home/ubuntu/scratch \
         --name "$CONTAINER_NAME" \
