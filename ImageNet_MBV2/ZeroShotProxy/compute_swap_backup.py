@@ -3,19 +3,28 @@ import torch
 import torch.nn as nn
 from PlainNet.basic_blocks import RELU as PlainNetReLU
 
-# 全局变量用于存储预先计算的mu和sigma
-_GLOBAL_MU = None
-_GLOBAL_SIGMA = None
-_GLOBAL_STATS_COMPUTED = False  # 标记是否已经计算过统计信息
-
 
 def count_parameters_in_MB(model):
   return np.sum(np.prod(v.size()) for name, v in model.named_parameters() if "auxiliary" not in name)/1e6
 
 def cal_regular_factor(model, mu, sigma):
     model_params = torch.as_tensor(count_parameters_in_MB(model)*1e3)
-    regular_factor = torch.exp(-(torch.pow((model_params-mu),2)/sigma))
-    return regular_factor
+    print(f"Model parameters: {model_params} KB")
+    print(f"Target mu: {mu} KB, sigma: {sigma} KB")
+    
+    # Ensure sigma is not too small to avoid numerical issues
+    if sigma < 1e-6:
+        sigma = 1.0
+        print("WARNING: sigma too small, set to 1.0")
+    
+    # Calculate regularization factor with safeguards
+    try:
+        regular_factor = torch.exp(-(torch.pow((model_params-mu),2)/sigma))
+        print(f"Calculated regularization factor: {regular_factor}")
+        return regular_factor
+    except Exception as e:
+        print(f"Error in regularization calculation: {e}")
+        return torch.tensor(1.0)  # Default to 1.0 if calculation fails
 
 class SampleWiseActivationPatterns(object):
     def __init__(self, device):
@@ -27,22 +36,43 @@ class SampleWiseActivationPatterns(object):
     def collect_activations(self, activations):
         n_sample = activations.size()[0]
         n_neuron = activations.size()[1]
+        print(f"Collecting activations with shape: {activations.shape}")
 
         if self.activations is None:
-            self.activations = torch.zeros(n_sample, n_neuron).to(self.device)  
+            self.activations = torch.zeros(n_sample, n_neuron).to(self.device)
+            print(f"Initialized activations tensor with shape: {self.activations.shape}")
+
+        # Check for NaN or Inf values
+        if torch.isnan(activations).any() or torch.isinf(activations).any():
+            print("WARNING: NaN or Inf values detected in activations")
+            # Replace NaN/Inf with zeros
+            activations = torch.nan_to_num(activations, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.activations = torch.sign(activations)
+        print(f"Applied sign function, unique values: {torch.unique(self.activations)}")
 
     @torch.no_grad()
     def calSWAP(self, regular_factor):
+        if self.activations is None:
+            print("WARNING: activations is None in calSWAP")
+            return 0.0
+            
+        print(f"Activation shape before transpose: {self.activations.shape}")
         self.activations = self.activations.T  # transpose the activation matrix: (samples, neurons) to (neurons, samples)
-        self.swap = torch.unique(self.activations, dim=0).size(0)
+        print(f"Activation shape after transpose: {self.activations.shape}")
+        
+        unique_patterns = torch.unique(self.activations, dim=0)
+        self.swap = unique_patterns.size(0)
+        print(f"Number of unique activation patterns (SWAP): {self.swap}")
+        print(f"Regularization factor: {regular_factor}")
         
         del self.activations
         self.activations = None
         torch.cuda.empty_cache()
 
-        return self.swap * regular_factor
+        result = self.swap * regular_factor
+        print(f"Final SWAP score: {result}")
+        return result
 
 
 class SWAP:
@@ -81,24 +111,58 @@ class SWAP:
         torch.cuda.empty_cache()
 
     def register_hook(self, model):
+        hook_count = 0
         for n, m in model.named_modules():
+            # hook both nn.ReLU modules and PlainNet basic_blocks.RELU blocks
             if isinstance(m, nn.ReLU) or isinstance(m, PlainNetReLU):
                 m.register_forward_hook(hook=self.hook_in_forward)
+                hook_count += 1
+                print(f"Registered hook for ReLU layer: {n}")
+        print(f"Total hooks registered: {hook_count}")
 
     def hook_in_forward(self, module, input, output):
         if isinstance(input, tuple) and len(input[0].size()) == 4:
             self.interFeature.append(output.detach())
+            print(f"Hook captured activation with shape: {output.shape}")
 
     def forward(self):
         self.interFeature = []
         with torch.no_grad():
+            print(f"Input shape: {self.inputs.shape}")
             self.model.forward(self.inputs.to(self.device))
-            if len(self.interFeature) == 0: 
+            print(f"Number of captured activation layers: {len(self.interFeature)}")
+            if len(self.interFeature) == 0:
+                print("WARNING: No activations captured. Check if model has ReLU layers.")
                 return 0.0
-            activtions = torch.cat([f.view(self.inputs.size(0), -1) for f in self.interFeature], 1)         
-            self.swap.collect_activations(activtions)
-            
-            return self.swap.calSWAP(self.regular_factor)
+                
+            try:
+                activtions = torch.cat([f.view(self.inputs.size(0), -1) for f in self.interFeature], 1)
+                print(f"Concatenated activations shape: {activtions.shape}")
+                self.swap.collect_activations(activtions)
+                
+                return self.swap.calSWAP(self.regular_factor)
+            except Exception as e:
+                print(f"Error in SWAP forward: {e}")
+                import traceback
+                traceback.print_exc()
+                return 0.0
+
+    def _hook_fn(self, module, inp, out):
+        """Forward hook函数，用于收集ReLU层的输出特征
+        
+        Args:
+            module: PyTorch模块
+            inp: 输入张量
+            out: 输出张量
+        """
+        # out: shape (N, C, H, W) --> reshape to (N, -1)
+        feats = out.detach().reshape(out.size(0), -1)
+        self.inter_feats.append(feats)
+
+    def _clear_hooks(self, hooks):
+        for h in hooks:
+            h.remove()
+        hooks.clear()
 
 
 def compute_params_stats(model_list, top_k=100):
@@ -126,32 +190,7 @@ def compute_params_stats(model_list, top_k=100):
     
     return mu, sigma
 
-
-def precompute_params_stats(model_list, top_k=1000):
-    """预先计算模型参数量的统计信息并存储在全局变量中
-    
-    Args:
-        model_list: 模型列表
-        top_k: 使用前k个模型来计算统计信息，默认使用1000个模型
-    
-    Returns:
-        tuple: (mu, sigma) mu为参数量均值（KB），sigma为标准差（KB）
-    """
-    global _GLOBAL_MU, _GLOBAL_SIGMA, _GLOBAL_STATS_COMPUTED
-    
-    # 如果已经计算过，直接返回
-    if _GLOBAL_STATS_COMPUTED and _GLOBAL_MU is not None and _GLOBAL_SIGMA is not None:
-        print(f"使用已预先计算的统计信息 - mu: {_GLOBAL_MU} KB, sigma: {_GLOBAL_SIGMA} KB")
-        return _GLOBAL_MU, _GLOBAL_SIGMA
-    
-    # 计算并存储
-    _GLOBAL_MU, _GLOBAL_SIGMA = compute_params_stats(model_list, top_k)
-    _GLOBAL_STATS_COMPUTED = True  # 标记为已计算
-    print(f"预先计算的统计信息 - mu: {_GLOBAL_MU} KB, sigma: {_GLOBAL_SIGMA} KB (基于 {min(top_k, len(model_list))} 个模型)")
-    
-    return _GLOBAL_MU, _GLOBAL_SIGMA
-
-def compute_swap_score(gpu, model, inputs, regular=False, mu=None, sigma=None, model_list=None, use_global_stats=True):
+def compute_swap_score(gpu, model, inputs, regular=False, mu=None, sigma=None, model_list=None):
     """计算SWAP分数
     
     Args:
@@ -159,40 +198,37 @@ def compute_swap_score(gpu, model, inputs, regular=False, mu=None, sigma=None, m
         model: 要计算的模型
         inputs: 输入数据
         regular: 是否使用参数量正则化
-        mu: 目标参数量均值（KB），如果为None且regular=True则从 model_list 计算或使用全局值
-        sigma: 参数量标准差（KB），如果为None且regular=True则从 model_list 计算或使用全局值
+        mu: 目标参数量均值（KB），如果为None且regular=True则从 model_list 计算
+        sigma: 参数量标准差（KB），如果为None且regular=True则从 model_list 计算
         model_list: 用于计算mu和sigma的模型列表
-        use_global_stats: 是否使用全局预先计算的统计信息，默认为True
     
     Returns:
         float: SWAP分数
     """
-    global _GLOBAL_MU, _GLOBAL_SIGMA, _GLOBAL_STATS_COMPUTED
+    print("\n==== Starting SWAP score computation ====\n")
+    print(f"Regular: {regular}, GPU: {gpu}")
+    print(f"Input shape: {inputs.shape}")
     
     # 检查模型是否有ReLU层
     relu_count = 0
     for n, m in model.named_modules():
         if isinstance(m, nn.ReLU) or isinstance(m, PlainNetReLU):
             relu_count += 1
+    print(f"Number of ReLU layers in model: {relu_count}")
     
     if relu_count == 0:
+        print("WARNING: No ReLU layers found in model. SWAP calculation will fail.")
         return 0.0
     
-    # 如果需要正则化但没有提供mu和sigma
+    # 如果需要正则化但没有提供mu和sigma，尝试从 model_list 计算
     if regular and (mu is None or sigma is None):
-        # 优先使用全局预先计算的统计信息
-        if use_global_stats and _GLOBAL_STATS_COMPUTED and _GLOBAL_MU is not None and _GLOBAL_SIGMA is not None:
-            mu = _GLOBAL_MU
-            sigma = _GLOBAL_SIGMA
-            print(f"使用全局预先计算的统计信息 - mu: {mu} KB, sigma: {sigma} KB")
-        # 如果没有全局统计信息且提供了model_list，则计算
-        elif model_list is not None:
-            mu, sigma = compute_params_stats(model_list)
-            print(f"使用当前种群计算的统计信息 - mu: {mu} KB, sigma: {sigma} KB (基于 {len(model_list)} 个模型)")
-        # 如果都没有，则禁用正则化
-        else:
-            print("没有可用的统计信息，禁用正则化")
+        if model_list is None:
+            print("WARNING: regular=True but model_list is None. Cannot compute mu and sigma.")
             regular = False
+        else:
+            print(f"Computing mu and sigma from {len(model_list)} models")
+            mu, sigma = compute_params_stats(model_list)
+            print(f"Computed mu={mu}, sigma={sigma}")
     
     # 将模型放到指定GPU(如果gpu is not None)
     if gpu is not None:
@@ -203,9 +239,13 @@ def compute_swap_score(gpu, model, inputs, regular=False, mu=None, sigma=None, m
     
     # 确保sigma不为零，避免除零错误
     if regular and sigma is not None and sigma < 1e-6:
+        print("WARNING: sigma is too small, setting to 1.0 to avoid division by zero")
         sigma = 1.0
     
     swap_evaluator = SWAP(model=model, inputs=inputs, device=device, regular=regular, mu=mu, sigma=sigma)
     swap_score = swap_evaluator.forward()
+    
+    print(f"Final SWAP score: {swap_score}")
+    print("\n==== SWAP computation completed ====\n")
     
     return float(swap_score) if swap_score is not None else 0.0

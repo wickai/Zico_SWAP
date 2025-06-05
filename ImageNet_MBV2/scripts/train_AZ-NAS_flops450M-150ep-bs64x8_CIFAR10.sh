@@ -17,8 +17,8 @@ set -e
 # fi
 
 metric=AZ_NAS
-population_size=200
-evolution_max_iter=5000
+population_size=1024
+evolution_max_iter=1e5
 seed=123
 num_workers=12
 init=custom_kaiming

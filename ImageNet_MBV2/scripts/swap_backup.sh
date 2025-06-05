@@ -16,60 +16,54 @@ set -e
 # 	exit 1
 # fi
 
-metric=swap 
+metric=swap #AZ_NAS
 population_size=1024
 evolution_max_iter=1e5
 
 gpu=0
 seed=123
-swap_batch_size=64
-echo "Run this script with search_gpu=$gpu, seed=$seed, swap_batch_size=$swap_batch_size"
+echo "Run this script with search_gpu=$gpu, seed=$seed"
 
 cd ../
 
-save_dir=./save_dir/${metric}_flops450M-searchbs64-pop${population_size}-iter${evolution_max_iter}-${seed}_28thApril_CIFAR10
+save_dir=./save_dir/${metric}_flops450M-searchbs64-pop${population_size}-iter${evolution_max_iter}-${seed}_28thApril
 mkdir -p ${save_dir}
 evolution_max_iter=$(printf "%.0f" $evolution_max_iter)
 
-resolution=32
+resolution=224
 budget_flops=450e6
 max_layers=14
+# population_size=1024
 epochs=150
+# evolution_max_iter=100000
 
 echo "SuperConvK3BNRELU(3,8,2,1)SuperResIDWE6K3(8,32,2,8,1)SuperResIDWE6K3(32,48,2,32,1)\
 SuperResIDWE6K3(48,96,2,48,1)SuperResIDWE6K3(96,128,2,96,1)\
 SuperConvK1BNRELU(128,2048,1,1)" > ${save_dir}/init_plainnet.txt
 
 
-echo "Starting SWAP evolution search with debug output..."
-
-# Set environment variables to enable more verbose output
-export PYTHONUNBUFFERED=1
-
 python evolution_search_others.py --gpu ${gpu} \
   --zero_shot_score ${metric} \
   --search_space SearchSpace/search_space_IDW_fixfc.py \
   --budget_flops ${budget_flops} \
   --max_layers ${max_layers} \
-  --batch_size 16 \
-  --swap_batch_size ${swap_batch_size} \
+  --batch_size 64 \
   --input_image_size ${resolution} \
   --plainnet_struct_txt ${save_dir}/init_plainnet.txt \
-  --num_classes 10 \
+  --num_classes 1000 \
   --evolution_max_iter ${evolution_max_iter} \
   --population_size ${population_size} \
   --save_dir ${save_dir} \
-  --dataset cifar10 \
-  --num_worker 4 \
+  --dataset imagenet-1k\
+  --num_worker 0 \
+  --rand_input True \
   --search_no_res False \
   --seed ${seed} \
-  --datapath ./data
-  
-  #/home/ubuntu/scratch/kaiwei/unzip_imagenet/ILSVRC/Data/CLS-LOC
+  --datapath /home/ubuntu/scratch/kaiwei/unzip_imagenet/ILSVRC/Data/CLS-LOC
   #/dataset/ILSVRC2012/
 
 python analyze_model.py \
-  --input_image_size 32 \
-  --num_classes 10 \
+  --input_image_size 224 \
+  --num_classes 1000 \
   --arch Masternet.py:MasterNet \
   --plainnet_struct_txt ${save_dir}/best_structure.txt
