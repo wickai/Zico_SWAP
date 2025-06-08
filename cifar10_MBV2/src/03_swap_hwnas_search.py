@@ -13,7 +13,19 @@ import random
 import logging
 import argparse
 import numpy as np
+
+# pandas导入与版本检查
 import pandas as pd
+try:
+    # 检查pandas版本
+    pd_version = pd.__version__
+    print(f"使用pandas版本: {pd_version}")
+    # 如果是较旧版本，可能需要特殊处理
+    from pkg_resources import parse_version
+    if parse_version(pd_version) < parse_version('1.0.0'):
+        print("警告: 使用的pandas版本较旧，可能存在兼容性问题")
+except Exception as e:
+    print(f"pandas版本检查失败: {e}")
 
 import torch
 import torch.nn as nn
@@ -210,27 +222,43 @@ def evaluate(model, loader, device):
     model.eval()
     correct_top1, correct_top5, total = 0, 0, 0
     
-    for inputs, targets in loader:
+    # 添加详细输出
+    detailed_output = len(loader) <= 10  # 当测试集较小时提供详细输出
+    
+    for batch_idx, (inputs, targets) in enumerate(loader):
         inputs, targets = inputs.to(device), targets.to(device)
         outputs = model(inputs)
         
         # Top-1准确率
         _, predicted = outputs.max(1)
-        correct_top1 += predicted.eq(targets).sum().item()
+        batch_correct = predicted.eq(targets).sum().item()
+        correct_top1 += batch_correct
         
         # Top-5准确率 (对于CIFAR-100更有意义)
         _, predicted_top5 = outputs.topk(5, 1, True, True)
-        correct_top5 += predicted_top5.eq(targets.view(-1, 1).expand_as(predicted_top5)).sum().item()
+        batch_correct_top5 = predicted_top5.eq(targets.view(-1, 1).expand_as(predicted_top5)).sum().item()
+        correct_top5 += batch_correct_top5
         
         total += targets.size(0)
+        
+        # 输出详细信息
+        if detailed_output:
+            batch_acc = batch_correct / targets.size(0)
+            print(f"Test Batch {batch_idx}/{len(loader)}: "
+                  f"Acc@1={batch_acc*100:.2f}%, "
+                  f"Batch Correct={batch_correct}/{targets.size(0)}")
     
     if total == 0:
         return 0.0, 0.0
 
     top1_acc = correct_top1 / total
     top5_acc = correct_top5 / total
+    
+    # 添加更详细的输出
+    print(f"评估结果: 总样本={total}, 正确预测Top1={correct_top1}, Top5={correct_top5}")
+    print(f"Accuracy: Top1={top1_acc*100:.2f}%, Top5={top5_acc*100:.2f}%")
+    
     return top1_acc, top5_acc
-
 
 # ============ 2) 数据增强：Cutout实现 ============
 
@@ -328,25 +356,10 @@ class SampleWiseActivationPatterns:
     def calc_swap(self, reg_factor=1.0):
         if self.activations is None:
             return 0
-        
-        # 转置获取每个样本的激活模式
-        self.activations = self.activations.t()
-        
-        # 计算激活模式的统计特性
+        # 转置后 unique(dim=0)
+        self.activations = self.activations.t()  # => (features, N)
         unique_patterns = torch.unique(self.activations, dim=0).size(0)
-        
-        # 计算激活模式的熵
-        n_samples = self.activations.size(0)
-        pattern_entropy = 0
-        if n_samples > 1:
-            # 简化的熵计算
-            pattern_similarity = torch.matmul(self.activations, self.activations.t()) / self.activations.size(1)
-            pattern_entropy = -torch.sum(pattern_similarity * torch.log(pattern_similarity + 1e-10)) / n_samples
-        
-        # 结合熵和唯一模式数
-        enhanced_swap = unique_patterns * (1 + 0.1 * pattern_entropy)
-        
-        return enhanced_swap * reg_factor
+        return unique_patterns * reg_factor
 
 
 class SWAP:
@@ -372,17 +385,32 @@ class SWAP:
             reg_factor = cal_regular_factor(model, self.mu, self.sigma)
         else:
             reg_factor = 1.0
-        # ? 没有对relu加Hook？
-        
-        # 使用多个批次样本计算SWAP，提高稳定性
-        swap_scores = []
-        for _ in range(3):  # 使用不同批次
-            with torch.no_grad():
-                model(inputs)  # 前向传播激活模式收集
-            score = self.swap_evaluator.calc_swap(reg_factor)
-            swap_scores.append(score)
-            self.inter_feats = []  # 清空特征
-        return np.mean(swap_scores)  # 更稳定的评估
+
+        # 2) 注册hook，抓取 ReLU / ReLU6 的输出
+        hooks = []
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.ReLU, nn.ReLU6)):
+                h = module.register_forward_hook(self._hook_fn)
+                hooks.append(h)
+
+        self.inter_feats = []
+
+        # 3) 前向推理（只需要 1 次，无需训练）
+        model.eval()
+        with torch.no_grad():
+            model(inputs.to(self.device))
+
+        # 4) 计算SWAP
+        if len(self.inter_feats) == 0:
+            self._clear_hooks(hooks)
+            return 0
+        all_feats = torch.cat(self.inter_feats, dim=1)  # (N, sum_of_features)
+        self.swap_evaluator.collect_activations(all_feats)
+        swap_score = self.swap_evaluator.calc_swap(reg_factor)
+
+        self._clear_hooks(hooks)
+        self.inter_feats = []
+        return swap_score
     
     def estimate_power(self, op_codes, width_codes):
         """
@@ -603,7 +631,7 @@ class SWAP:
         except Exception as e:
             logging.warning(f"查询指标时出错: {e}")
             return {}, False
-    
+            
     def _convert_to_hwnas_encoding(self, op_codes):
         """
         将我们的架构编码转换为HW-NAS-Bench的FBNet编码格式的简单版本
@@ -1024,49 +1052,7 @@ class EvolutionarySearch:
         for i in range(len(mutated)):
             if random.random() < self.current_mutation_rate:  # 使用当前变异率
                 mutated[i] = random.randrange(len(self.search_space.width_choices))
-        return mutated
-
-    # 使用多岛屿模型和不同的进化策略
-    def initialize_subpopulations(self):
-        subpops = []
-        strategies = [
-            {"swap_weight": 0.8, "power_weight": 0.2},  # 偏重SWAP
-            {"swap_weight": 0.5, "power_weight": 0.5},  # 平衡
-            {"swap_weight": 0.2, "power_weight": 0.8},  # 偏重功耗
-        ]
-        
-        for strategy in strategies:
-            population = []
-            for _ in range(self.population_size // len(strategies)):
-                op_codes = self.search_space.random_op_codes()
-                width_codes = self.search_space.random_width_codes()
-                population.append({
-                    "op_codes": op_codes, 
-                    "width_codes": width_codes,
-                    "fitness_values": [0, 0],
-                    "strategy": strategy
-                })
-            subpops.append(population)
-        
-        return subpops
-
-    # 动态调整搜索参数
-    def update_search_params(self, gen):
-        progress = gen / self.n_generations
-        
-        # 自适应变异率
-        if progress < 0.3:  # 早期探索阶段
-            self.current_mutation_rate = min(0.3, self.initial_mutation_rate * 1.5)
-        elif progress < 0.7:  # 中期过渡
-            self.current_mutation_rate = self.initial_mutation_rate * (1.0 - 0.6 * (progress - 0.3) / 0.4)
-        else:  # 后期精细化
-            self.current_mutation_rate = max(0.02, self.initial_mutation_rate * 0.2)
-        
-        # 调整选择压力
-        self.tournament_size = 2 if progress < 0.5 else 3 if progress < 0.8 else 4
-        
-        # 调整交叉和变异策略
-        self.crossover_rate = 0.9 - 0.3 * progress  # 逐渐减少交叉率
+        return mutated 
 
 # ============ 6) 最终训练 ============
 
@@ -1104,20 +1090,76 @@ def train_and_eval(model, train_loader, test_loader, device,
     if torch.cuda.device_count() > 1:
         print(f"=> 使用 {torch.cuda.device_count()} 个GPU进行训练...")
         model = nn.DataParallel(model)
+    
+    # 改进模型初始化 - 使用kaiming_normal替代原来的简单初始化
+    print("执行模型重初始化...")
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:  # 检查bias是否存在
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            if m.weight is not None:  # 检查weight是否存在
+                nn.init.constant_(m.weight, 1)
+            if m.bias is not None:  # 检查bias是否存在
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, 0, 0.01)
+            if m.bias is not None:  # 检查bias是否存在
+                nn.init.constant_(m.bias, 0)
 
+    # 使用较小的学习率开始训练，防止梯度爆炸
+    initial_lr = min(lr, 0.001)  # 从较小学习率开始
+    print(f"初始学习率: {initial_lr}，目标学习率: {lr}")
+    
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    # 使用带动量和权重衰减的优化器
+    optimizer = optim.SGD(model.parameters(), lr=initial_lr, momentum=0.9, weight_decay=5e-4)
+    
+    # Warmup + 余弦退火学习率
+    def warmup_cosine_schedule(epoch):
+        warmup_epochs = min(10, epochs // 5)  # 预热阶段占总轮数的20%，但最多10轮
+        if epoch < warmup_epochs:
+            # 预热阶段线性增加学习率
+            return (epoch + 1) / warmup_epochs * lr / initial_lr
+        else:
+            # 余弦退火阶段
+            return 0.5 * (1 + math.cos(math.pi * (epoch - warmup_epochs) / (epochs - warmup_epochs)))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_cosine_schedule)
 
     best_acc = 0.0
     best_state = {'epoch': 0, 'state_dict': model.state_dict(), 'best_acc': best_acc}
     
+    # 增加提前停止的计数器
+    patience = 15  # 15轮无改善则提前停止
+    patience_counter = 0
+    
+    # 记录训练和验证指标
+    train_losses = []
+    train_accs = []
+    test_accs = []
+    
+    # 训练开始时间
+    training_start_time = time.time()
+    
+    # 如果准确率长时间不提升，尝试调整学习率
+    stagnant_counter = 0
+    lr_adjustments = 0
+    max_lr_adjustments = 3
+    
     for epoch in range(epochs):
+        epoch_start_time = time.time()
         model.train()
         total_loss = 0
         correct_top1, total = 0, 0
+        
+        # 打印当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1} 当前学习率: {current_lr:.6f}")
 
-        for inputs, labels in train_loader:
+        for batch_idx, (inputs, labels) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
 
             # Mixup处理
@@ -1132,6 +1174,10 @@ def train_and_eval(model, train_loader, test_loader, device,
 
             optimizer.zero_grad()
             loss.backward()
+            
+            # 添加梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            
             optimizer.step()
 
             total_loss += loss.item() * labels.size(0)
@@ -1139,12 +1185,21 @@ def train_and_eval(model, train_loader, test_loader, device,
             _, preds = outputs.max(1)
             correct_top1 += preds.eq(labels).sum().item()
             total += labels.size(0)
+            
+            # 每100个批次打印一次训练情况
+            if batch_idx % 100 == 0:
+                batch_acc = preds.eq(labels).sum().item() / labels.size(0)
+                print(f"Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f}, Acc: {batch_acc*100:.2f}%")
 
         train_loss = total_loss / total
         train_acc_top1 = correct_top1 / total if total > 0 else 0.
+        train_losses.append(train_loss)
+        train_accs.append(train_acc_top1)
 
         # 在测试集上计算Top-1 / Top-5
+        model.eval()  # 确保在评估前切换到评估模式
         test_top1, test_top5 = evaluate(model, test_loader, device)
+        test_accs.append(test_top1)
         
         # 保存最佳模型
         if test_top1 > best_acc:
@@ -1154,18 +1209,125 @@ def train_and_eval(model, train_loader, test_loader, device,
                 'state_dict': model.state_dict(),
                 'best_acc': best_acc,
             }
-
-        scheduler.step()
+            patience_counter = 0  # 重置提前停止计数器
+            stagnant_counter = 0  # 重置停滞计数器
+        else:
+            patience_counter += 1
+            stagnant_counter += 1
+            
+        # 如果准确率长时间停滞在低水平，尝试调整学习率
+        if stagnant_counter >= 5 and test_top1 < 0.1 and lr_adjustments < max_lr_adjustments:
+            # 减小学习率重试
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.5
+            print(f"警告: 准确率停滞不前，学习率调整为: {optimizer.param_groups[0]['lr']:.6f}")
+            stagnant_counter = 0
+            lr_adjustments += 1
+            
+            # 如果准确率极低，可能需要重新初始化网络
+            if test_top1 < 0.02 and epoch > 10:
+                print("重新初始化部分网络层...")
+                # 仅重新初始化全连接层和最后几个卷积层
+                for name, module in model.named_modules():
+                    if 'classifier' in name or 'conv' in name and any(f'layer{i}' in name for i in [3, 4]):
+                        if isinstance(module, nn.Conv2d):
+                            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                            if module.bias is not None:  # 检查bias是否存在
+                                nn.init.constant_(module.bias, 0)
+                        elif isinstance(module, nn.Linear):
+                            nn.init.normal_(module.weight, 0, 0.01)
+                            if module.bias is not None:  # 检查bias是否存在
+                                nn.init.constant_(module.bias, 0)
+            
+        # 计算每轮训练耗时
+        epoch_time = time.time() - epoch_start_time
+        
+        # 计算预计剩余时间
+        elapsed_time = time.time() - training_start_time
+        avg_time_per_epoch = elapsed_time / (epoch + 1)
+        remaining_epochs = epochs - (epoch + 1)
+        estimated_remaining_time = avg_time_per_epoch * remaining_epochs
+        
+        # 计算分钟和秒
+        mins, secs = divmod(estimated_remaining_time, 60)
+        hours, mins = divmod(mins, 60)
+        
+        # 学习率
+        current_lr = optimizer.param_groups[0]['lr']
 
         logging.info(f"Epoch [{epoch+1}/{epochs}] | "
                      f"Loss={train_loss:.3f}, "
                      f"Train@1={train_acc_top1*100:.2f}%, "
-                     f"Test@1={test_top1*100:.2f}%, Test@5={test_top5*100:.2f}%")
+                     f"Test@1={test_top1*100:.2f}%, Test@5={test_top5*100:.2f}% | "
+                     f"LR={current_lr:.6f}, Time={epoch_time:.1f}s, "
+                     f"ETA={int(hours)}h {int(mins)}m {int(secs)}s")
+        
+        # 打印到控制台
+        print(f"Epoch {epoch+1}/{epochs} - "
+              f"Loss: {train_loss:.3f}, Train Acc: {train_acc_top1*100:.2f}%, "
+              f"Test Acc: {test_top1*100:.2f}%, Best: {best_acc*100:.2f}%")
 
+        scheduler.step()
+        
+        # 提前停止
+        if patience_counter >= patience and epochs > 50:
+            logging.info(f"提前停止：连续 {patience} 轮没有改善")
+            print(f"提前停止：连续 {patience} 轮没有改善")
+            break
+            
+        # 如果准确率仍然很低，给出警告
+        if epoch >= 10 and best_acc < 0.05:
+            print("警告：训练10轮后准确率仍低于5%，模型可能存在架构问题或初始化问题")
+            
+        # 如果前5轮准确率没有提升，尝试更激进的学习率调整
+        if epoch == 5 and best_acc < 0.02:
+            print("前5轮准确率无明显提升，尝试更激进的学习率和优化器调整")
+            # 尝试Adam优化器
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            # 重新设置学习率调度器
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
+
+    # 训练结束，计算总耗时
+    total_time = time.time() - training_start_time
+    hours, remainder = divmod(total_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"训练完成，总耗时: {int(hours)}小时 {int(minutes)}分钟 {int(seconds)}秒")
+    
     # 恢复最佳模型
     model.load_state_dict(best_state['state_dict'])
     final_top1, final_top5 = evaluate(model, test_loader, device)
     logging.info(f"Final Test Accuracy: Top1={final_top1*100:.2f}%, Top5={final_top5*100:.2f}%")
+    
+    # 记录最佳精度轮次
+    best_epoch = best_state['epoch']
+    print(f"最佳测试准确率 (Epoch {best_epoch}): Top1={final_top1*100:.2f}%, Top5={final_top5*100:.2f}%")
+    
+    # 如果有足够训练轮数，尝试绘制训练曲线
+    if epochs > 5 and HAS_MATPLOTLIB:
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.subplot(1, 2, 1)
+            plt.plot(range(1, len(train_losses)+1), train_losses, label='Train Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.legend()
+            
+            plt.subplot(1, 2, 2)
+            plt.plot(range(1, len(train_accs)+1), [acc*100 for acc in train_accs], label='Train Acc')
+            plt.plot(range(1, len(test_accs)+1), [acc*100 for acc in test_accs], label='Test Acc')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy (%)')
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(f'./logs/swap_search/training_curve.png')
+            plt.close()
+            print(f"训练曲线已保存到: ./logs/swap_search/training_curve.png")
+        except Exception as e:
+            print(f"绘制训练曲线失败: {e}")
+    
     return final_top1
 
 
@@ -1218,11 +1380,20 @@ def get_dataset_dataloaders(dataset_name, root, batch_size, num_workers=2,
     else:
         raise ValueError(f"不支持的数据集: {dataset_name}")
     
+    # 打印数据集信息
+    print(f"数据集: {dataset_name}, 类别数: {num_classes}, 图像大小: {img_size}x{img_size}")
+    print(f"均值: {mean}, 标准差: {std}")
+    print(f"使用Cutout: {use_cutout}, Cutout长度: {cutout_length}" if use_cutout else "未使用Cutout")
+    
     # 训练集数据增强
     if dataset_name in ['cifar10', 'cifar100']:
         train_transform = transforms.Compose([
             transforms.RandomCrop(img_size, padding=4),
             transforms.RandomHorizontalFlip(),
+            # 添加随机旋转
+            transforms.RandomRotation(15),
+            # 添加随机亮度和对比度调整
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
@@ -1267,21 +1438,51 @@ def get_dataset_dataloaders(dataset_name, root, batch_size, num_workers=2,
             transform=test_transform
         )
     
+    # 验证数据集的类别分布
+    if dataset_name in ['cifar10', 'cifar100']:
+        print("验证数据集类别分布...")
+        class_counts = [0] * num_classes
+        for _, label in train_ds:
+            class_counts[label] += 1
+        
+        print(f"训练集类别分布: 最小={min(class_counts)}个样本/类, 最大={max(class_counts)}个样本/类")
+        # 检查是否均衡
+        if min(class_counts) == max(class_counts):
+            print("类别分布均衡")
+        else:
+            print("类别分布不均衡，但对于CIFAR数据集这是正常的")
+    
     # 创建数据加载器
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        drop_last=False  # 保留最后一个不完整批次
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        drop_last=False
     )
+    
+    print(f"训练集: {len(train_ds)}个样本, {len(train_loader)}个批次")
+    print(f"测试集: {len(test_ds)}个样本, {len(test_loader)}个批次")
+    
+    # 检查第一个批次以验证数据加载正确
+    try:
+        print("验证数据加载...")
+        sample_batch, sample_labels = next(iter(train_loader))
+        print(f"批次形状: {sample_batch.shape}, 标签形状: {sample_labels.shape}")
+        print(f"标签范围: {sample_labels.min().item()} - {sample_labels.max().item()}")
+        print(f"图像值范围: {sample_batch.min().item():.4f} - {sample_batch.max().item():.4f}")
+    except Exception as e:
+        print(f"数据加载验证失败: {e}")
+    
     return train_loader, test_loader, mean, std, num_classes, small_input
 
 
@@ -1331,7 +1532,7 @@ def setup_logger(log_path):
         ]
     ) 
 
-# ============ 10) 主函数入口 ============
+# ============ 10) 参数解析 ============
 
 def parse_args():
     parser = argparse.ArgumentParser("MobileNetV2 Architecture Search with SWAP")
@@ -1391,8 +1592,9 @@ def parse_args():
                        help="是否为帕累托前沿的所有解查询HW-NAS-Bench accuracy（可能较耗时）")
 
     args = parser.parse_args()
-    return args
+    return args 
 
+# ============ 11) 可视化函数 ============
 
 def plot_pareto_front(pareto_front, save_path='./logs/pareto_front.png'):
     """
@@ -1422,26 +1624,28 @@ def plot_pareto_front(pareto_front, save_path='./logs/pareto_front.png'):
     # 创建一个新的图形
     plt.figure(figsize=(12, 10))
     
+    # 使用英文标签代替中文，避免字体问题
+    
     # 1. SWAP vs 功耗的散点图
     plt.subplot(2, 2, 1)
     sc = plt.scatter(swap_scores, power_values, c=range(len(swap_scores)), 
                cmap='viridis', alpha=0.8, s=100)
     
-    plt.colorbar(sc, label='解的索引')
-    plt.xlabel('SWAP分数 (越高越好)')
-    plt.ylabel('功耗 (mJ) (越低越好)')
-    plt.title('SWAP vs 功耗的帕累托前沿')
+    plt.colorbar(sc, label='Solution Index')
+    plt.xlabel('SWAP Score (Higher is Better)')
+    plt.ylabel('Power (mJ) (Lower is Better)')
+    plt.title('SWAP vs Power Pareto Front')
     plt.grid(True, linestyle='--', alpha=0.7)
     
     # 标记最高SWAP和最低功耗的点
     max_swap_idx = np.argmax(swap_scores)
     min_power_idx = np.argmin(power_values)
     
-    plt.annotate(f"最高SWAP", xy=(swap_scores[max_swap_idx], power_values[max_swap_idx]),
+    plt.annotate(f"Highest SWAP", xy=(swap_scores[max_swap_idx], power_values[max_swap_idx]),
                 xytext=(swap_scores[max_swap_idx], power_values[max_swap_idx]*1.1),
                 arrowprops=dict(facecolor='red', shrink=0.05))
     
-    plt.annotate(f"最低功耗", xy=(swap_scores[min_power_idx], power_values[min_power_idx]),
+    plt.annotate(f"Lowest Power", xy=(swap_scores[min_power_idx], power_values[min_power_idx]),
                 xytext=(swap_scores[min_power_idx]*0.9, power_values[min_power_idx]),
                 arrowprops=dict(facecolor='blue', shrink=0.05))
     
@@ -1450,10 +1654,10 @@ def plot_pareto_front(pareto_front, save_path='./logs/pareto_front.png'):
     sc2 = plt.scatter(op_complexity, power_values, c=range(len(op_complexity)), 
                 cmap='viridis', alpha=0.8, s=100)
     
-    plt.colorbar(sc2, label='解的索引')
-    plt.xlabel('操作复杂度 (操作数)')
-    plt.ylabel('功耗 (mJ)')
-    plt.title('操作复杂度 vs 功耗')
+    plt.colorbar(sc2, label='Solution Index')
+    plt.xlabel('Operation Complexity (Op Count)')
+    plt.ylabel('Power (mJ)')
+    plt.title('Operation Complexity vs Power')
     plt.grid(True, linestyle='--', alpha=0.7)
     
     # 3. 操作复杂度 vs SWAP的散点图
@@ -1461,10 +1665,10 @@ def plot_pareto_front(pareto_front, save_path='./logs/pareto_front.png'):
     sc3 = plt.scatter(op_complexity, swap_scores, c=range(len(op_complexity)), 
                 cmap='viridis', alpha=0.8, s=100)
     
-    plt.colorbar(sc3, label='解的索引')
-    plt.xlabel('操作复杂度 (操作数)')
-    plt.ylabel('SWAP分数')
-    plt.title('操作复杂度 vs SWAP')
+    plt.colorbar(sc3, label='Solution Index')
+    plt.xlabel('Operation Complexity (Op Count)')
+    plt.ylabel('SWAP Score')
+    plt.title('Operation Complexity vs SWAP')
     plt.grid(True, linestyle='--', alpha=0.7)
     
     # 4. 3D图：SWAP vs 功耗 vs 操作复杂度
@@ -1472,11 +1676,11 @@ def plot_pareto_front(pareto_front, save_path='./logs/pareto_front.png'):
     sc4 = ax.scatter(swap_scores, power_values, op_complexity, 
                c=range(len(swap_scores)), cmap='viridis', s=100)
     
-    plt.colorbar(sc4, label='解的索引')
-    ax.set_xlabel('SWAP分数')
-    ax.set_ylabel('功耗 (mJ)')
-    ax.set_zlabel('操作复杂度 (操作数)')
-    ax.set_title('SWAP vs 功耗 vs 操作复杂度')
+    plt.colorbar(sc4, label='Solution Index')
+    ax.set_xlabel('SWAP Score')
+    ax.set_ylabel('Power (mJ)')
+    ax.set_zlabel('Operation Complexity (Op Count)')
+    ax.set_title('SWAP vs Power vs Operation Complexity')
     
     # 保存图像
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1485,6 +1689,8 @@ def plot_pareto_front(pareto_front, save_path='./logs/pareto_front.png'):
     plt.close()
     
     logging.info(f"帕累托前沿可视化图已保存至 {save_path}")
+
+# ============ 12) 主函数 ============
 
 def main():
     args = parse_args()
@@ -1688,7 +1894,54 @@ def main():
         print("保存帕累托前沿到CSV文件...")
         pareto_df = pd.DataFrame(pareto_data)
         pareto_file = os.path.join(log_path, f"pareto_front_{args.dataset}.csv")
-        pareto_df.to_csv(pareto_file, index=False)
+        
+        # 尝试多种方式保存数据
+        try:
+            # 方法1: 使用pandas to_csv
+            pareto_df.to_csv(pareto_file, index=False)
+        except ImportError as e:
+            print(f"pandas to_csv失败: {e}")
+            try:
+                # 方法2: 使用numpy保存
+                np.savetxt(
+                    pareto_file.replace('.csv', '.txt'), 
+                    np.array([[p['ID'], p['SWAP'], p['Power']] for p in pareto_data]),
+                    fmt='%d,%.3f,%.3f', 
+                    header='ID,SWAP,Power', 
+                    comments=''
+                )
+                print(f"已使用numpy保存到: {pareto_file.replace('.csv', '.txt')}")
+                
+                # 同时保存完整数据为JSON
+                import json
+                json_file = pareto_file.replace('.csv', '.json')
+                # 为JSON序列化处理numpy数组
+                json_data = []
+                for p in pareto_data:
+                    p_copy = p.copy()
+                    p_copy['SWAP'] = float(p_copy['SWAP'])
+                    p_copy['Power'] = float(p_copy['Power'])
+                    if p_copy['HW-NAS-Bench_Accuracy'] is not None:
+                        p_copy['HW-NAS-Bench_Accuracy'] = float(p_copy['HW-NAS-Bench_Accuracy'])
+                    json_data.append(p_copy)
+                    
+                with open(json_file, 'w') as f:
+                    json.dump(json_data, f, indent=2)
+                print(f"完整数据已保存为JSON: {json_file}")
+                
+                pareto_file = pareto_file.replace('.csv', '.txt')
+            except Exception as e2:
+                print(f"使用numpy保存也失败: {e2}")
+                print("尝试最基本的文本保存方式...")
+                
+                # 方法3: 使用基本的文本文件保存
+                with open(pareto_file.replace('.csv', '.txt'), 'w') as f:
+                    f.write("ID,SWAP,Power\n")
+                    for p in pareto_data:
+                        f.write(f"{p['ID']},{p['SWAP']:.3f},{p['Power']:.3f}\n")
+                print(f"已使用基本文本方式保存到: {pareto_file.replace('.csv', '.txt')}")
+                pareto_file = pareto_file.replace('.csv', '.txt')
+        
         print(f"帕累托前沿已保存至: {pareto_file}")
         logging.info(f"帕累托前沿已保存至 {pareto_file}")
         
@@ -1708,12 +1961,7 @@ def main():
     # 为简单起见，我们选择一个SWAP分数最高的解进行训练
     # 实际项目中可以根据需求选择平衡点
     print("\n=== 选择最佳架构 ===")
-    
-    # 使用智能选择策略从帕累托前沿选择最佳架构
-    best_individual = select_best_from_pareto(pareto_front, search_space, 
-                                             swap_weight=0.6, 
-                                             power_weight=0.3, 
-                                             complexity_weight=0.1)
+    best_individual = best_result  # 这个已经是SWAP最高的解
     
     print(f"🏆 最佳架构信息:")
     print(f"SWAP分数: {best_individual['fitness_values'][0]:.3f}")
@@ -1721,7 +1969,7 @@ def main():
     print(f"op_codes: {best_individual['op_codes']}")
     print(f"width_codes: {best_individual['width_codes']}")
     
-    logging.info(f"选择合适平衡点的架构进行训练:")
+    logging.info(f"选择SWAP分数最高的架构进行训练:")
     logging.info(f"最佳架构: op_codes={best_individual['op_codes']}, width_codes={best_individual['width_codes']}")
     logging.info(f"SWAP: {best_individual['fitness_values'][0]:.3f}, Power: {best_individual['fitness_values'][1]:.3f}")
 
@@ -1746,9 +1994,87 @@ def main():
 
     # 8) 构造最优模型
     print("\n=== 构建最优模型 ===")
-    best_model = search_space.build_model(best_individual["op_codes"], best_individual["width_codes"])
-    param_mb = count_parameters_in_MB(best_model)
-    print(f"模型参数量: {param_mb:.2f} MB")
+    
+    # 检查网络代码
+    print(f"检查架构代码:")
+    print(f"  操作码: {best_individual['op_codes']}")
+    print(f"  宽度码: {best_individual['width_codes']}")
+    
+    # 验证代码长度与搜索空间匹配
+    if len(best_individual["op_codes"]) != search_space.total_blocks:
+        print(f"警告: 操作码长度 ({len(best_individual['op_codes'])}) 与搜索空间的块数 ({search_space.total_blocks}) 不匹配")
+    
+    if len(best_individual["width_codes"]) != len(search_space.stage_setting):
+        print(f"警告: 宽度码长度 ({len(best_individual['width_codes'])}) 与搜索空间的阶段数 ({len(search_space.stage_setting)}) 不匹配")
+    
+    # 构建前检查搜索空间
+    print(f"搜索空间内操作列表: {search_space.op_list}")
+    print(f"宽度选项: {search_space.width_choices}")
+    
+    try:
+        best_model = search_space.build_model(best_individual["op_codes"], best_individual["width_codes"])
+        param_mb = count_parameters_in_MB(best_model)
+        print(f"模型参数量: {param_mb:.2f} MB")
+        
+        # 验证模型结构
+        print("验证模型结构:")
+        print(f"输入大小: {'32x32' if search_space.small_input else '224x224'}")
+        print(f"输出类别数: {search_space.num_classes}")  # 修正属性名
+        
+        # 使用更好的初始化
+        print("执行改进的模型初始化...")
+        for m in best_model.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:  # 检查bias是否存在
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                if m.weight is not None:  # 检查weight是否存在
+                    nn.init.constant_(m.weight, 1)
+                if m.bias is not None:  # 检查bias是否存在
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:  # 检查bias是否存在
+                    nn.init.constant_(m.bias, 0)
+                
+        # 检查网络层级和结构
+        total_layers = 0
+        conv_layers = 0
+        bn_layers = 0
+        linear_layers = 0
+        
+        for name, module in best_model.named_modules():
+            total_layers += 1
+            if isinstance(module, nn.Conv2d):
+                conv_layers += 1
+            elif isinstance(module, nn.BatchNorm2d):
+                bn_layers += 1
+            elif isinstance(module, nn.Linear):
+                linear_layers += 1
+                
+        print(f"网络结构统计: 总层数={total_layers}, 卷积层={conv_layers}, BN层={bn_layers}, 全连接层={linear_layers}")
+        
+        # 尝试进行一次前向传播以检查网络
+        try:
+            print("执行测试性前向传播...")
+            dummy_input = torch.randn(1, 3, 32 if search_space.small_input else 224, 32 if search_space.small_input else 224)
+            dummy_input = dummy_input.to(device)
+            best_model = best_model.to(device)
+            
+            with torch.no_grad():
+                output = best_model(dummy_input)
+            
+            print(f"前向传播成功! 输出形状: {output.shape}")
+        except Exception as e:
+            print(f"前向传播测试失败: {e}")
+    
+    except Exception as e:
+        print(f"构建模型失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+        
     logging.info(f"最佳模型参数量: {param_mb:.2f} MB")
 
     # 9) 尝试从HW-NAS-Bench查询accuracy
@@ -1829,9 +2155,22 @@ def main():
                 should_train = False
             else:
                 print(f"accuracy较低（{hwnas_accuracy*100:.2f}%），将进行训练以获得更好结果")
+    else:
+        # 未在HW-NAS-Bench中找到accuracy，必须进行训练
+        print("\n=== 未找到HW-NAS-Bench accuracy，将执行完整训练 ===")
+        should_train = True
+        # 即使用户设置了skip_training，也需要训练
+        if args.skip_training:
+            print("注意: 虽然设置了skip_training，但由于无法从HW-NAS-Bench获取accuracy，仍将执行训练")
+        
+        # 如果训练轮数太少，自动增加以确保充分训练
+        if args.train_epochs < 50:
+            original_epochs = args.train_epochs
+            args.train_epochs = max(args.train_epochs, 50)  # 确保至少50轮
+            print(f"自动调整训练轮数: {original_epochs} -> {args.train_epochs}")
     
     # 如果不进行完整训练，直接跳过训练步骤
-    if args.train_epochs == 0 or args.skip_training or not should_train:
+    if args.train_epochs == 0 or (args.skip_training and should_train == False):
         if not should_train:
             print("使用HW-NAS-Bench的accuracy，跳过训练步骤")
         else:
@@ -1845,7 +2184,9 @@ def main():
             'width_codes': best_individual['width_codes'],
             'state_dict': best_model.state_dict(),
             'swap_score': best_individual['fitness_values'][0],
-            'power': best_individual['fitness_values'][1]
+            'power': best_individual['fitness_values'][1],
+            'trained': should_train,  # 添加标志指示是否进行了训练
+            'train_epochs': args.train_epochs,
         }
         
         if hwnas_found and hwnas_accuracy is not None:
@@ -1862,10 +2203,14 @@ def main():
         # 可视化帕累托前沿
         if args.visualize and HAS_MATPLOTLIB:
             print("生成帕累托前沿可视化...")
-            viz_path = os.path.join(log_path, f"pareto_front_{args.dataset}.png")
-            plot_pareto_front(pareto_front, save_path=viz_path)
-            print(f"可视化图已保存到: {viz_path}")
-            logging.info(f"帕累托前沿可视化已保存到 {viz_path}")
+            try:
+                viz_path = os.path.join(log_path, f"pareto_front_{args.dataset}.png")
+                plot_pareto_front(pareto_front, save_path=viz_path)
+                print(f"可视化图已保存到: {viz_path}")
+                logging.info(f"帕累托前沿可视化已保存到 {viz_path}")
+            except Exception as e:
+                print(f"生成可视化图失败: {e}")
+                logging.error(f"生成可视化图失败: {e}")
         
         print(f"\n🎉 架构搜索完成！结果保存在: {log_path}")
         return
@@ -1874,14 +2219,23 @@ def main():
     print(f"\n=== 开始训练最优模型 ({args.train_epochs} epochs) ===")
     if hwnas_found and hwnas_accuracy is not None:
         print(f"HW-NAS-Bench预测accuracy: {hwnas_accuracy*100:.2f}%，将通过训练验证")
+    else:
+        print(f"未找到HW-NAS-Bench预测，将执行完整训练过程")
         
+    # 在未找到HW-NAS-Bench accuracy时，使用更高的初始学习率以加快收敛
+    effective_lr = args.lr
+    if not hwnas_found or hwnas_accuracy is None:
+        effective_lr = max(args.lr, 0.025)  # 确保学习率足够高
+        if effective_lr != args.lr:
+            print(f"调整学习率: {args.lr} -> {effective_lr}")
+    
     final_top1 = train_and_eval(
         best_model,
         train_loader,
         test_loader,
         device=device,
         epochs=args.train_epochs,
-        lr=args.lr,
+        lr=effective_lr,
         mixup_alpha=args.mixup_alpha,
         label_smoothing=args.label_smoothing
     )
@@ -1905,12 +2259,36 @@ def main():
         'state_dict': best_model.state_dict(),
         'top1_acc': final_top1,
         'swap_score': best_individual['fitness_values'][0],
-        'power': best_individual['fitness_values'][1]
+        'power': best_individual['fitness_values'][1],
+        'trained': should_train,  # 添加标志指示是否进行了训练
+        'train_epochs': args.train_epochs,
     }
     
     if hwnas_found and hwnas_accuracy is not None:
         save_dict['hwnas_accuracy'] = hwnas_accuracy
-        
+        # 如果同时有HW-NAS-Bench预测和实际训练结果，添加对比信息
+        if should_train:
+            diff = abs(final_top1 - hwnas_accuracy) * 100
+            save_dict['accuracy_diff'] = diff
+            save_dict['accuracy_diff_percent'] = (final_top1 / hwnas_accuracy - 1) * 100 if hwnas_accuracy > 0 else 0
+            
+            # 记录对比情况
+            comparison_file = os.path.join(log_path, f"hwnas_comparison_{args.dataset}.csv")
+            try:
+                if not os.path.exists(comparison_file):
+                    # 创建新文件并添加表头
+                    with open(comparison_file, 'w') as f:
+                        f.write("Architecture,SWAP,Power,HW-NAS-Bench_Acc,Trained_Acc,Diff,Diff_Percent\n")
+                
+                # 附加结果
+                with open(comparison_file, 'a') as f:
+                    arch_id = f"{best_individual['op_codes']}_{best_individual['width_codes']}"
+                    f.write(f"{arch_id},{best_individual['fitness_values'][0]:.2f},{best_individual['fitness_values'][1]:.2f},{hwnas_accuracy*100:.2f},{final_top1*100:.2f},{diff:.2f},{save_dict['accuracy_diff_percent']:.2f}\n")
+                
+                print(f"HW-NAS-Bench与训练结果对比已保存到: {comparison_file}")
+            except Exception as e:
+                print(f"保存对比结果失败: {e}")
+    
     torch.save(save_dict, model_path)
     print(f"模型已保存到: {model_path}")
     logging.info(f"模型已保存到 {model_path}")
@@ -1918,104 +2296,16 @@ def main():
     # 可视化帕累托前沿
     if args.visualize and HAS_MATPLOTLIB:
         print("生成帕累托前沿可视化...")
-        viz_path = os.path.join(log_path, f"pareto_front_{args.dataset}.png")
-        plot_pareto_front(pareto_front, save_path=viz_path)
-        print(f"可视化图已保存到: {viz_path}")
-        logging.info(f"帕累托前沿可视化已保存到 {viz_path}")
+        try:
+            viz_path = os.path.join(log_path, f"pareto_front_{args.dataset}.png")
+            plot_pareto_front(pareto_front, save_path=viz_path)
+            print(f"可视化图已保存到: {viz_path}")
+            logging.info(f"帕累托前沿可视化已保存到 {viz_path}")
+        except Exception as e:
+            print(f"生成可视化图失败: {e}")
+            logging.error(f"生成可视化图失败: {e}")
     
     print(f"\n🎉 所有任务完成！结果保存在: {log_path}")
-
-
-# 优化从帕累托前沿选择最终模型的策略
-def select_best_from_pareto(pareto_front, search_space, swap_weight=0.6, power_weight=0.3, complexity_weight=0.1):
-    """
-    从帕累托前沿智能选择一个平衡的解
-    
-    参数:
-        pareto_front: 帕累托前沿解集
-        search_space: 搜索空间对象
-        swap_weight: SWAP分数权重
-        power_weight: 功耗权重
-        complexity_weight: 复杂度权重
-    
-    返回:
-        选择的最佳个体
-    """
-    if not pareto_front:
-        return None
-        
-    # 如果只有一个解，直接返回
-    if len(pareto_front) == 1:
-        return pareto_front[0]
-    
-    candidates = []
-    
-    # 获取所有解的SWAP和功耗值
-    swap_values = [sol["fitness_values"][0] for sol in pareto_front]
-    power_values = [sol["fitness_values"][1] for sol in pareto_front]
-    
-    # 计算归一化因子
-    max_swap = max(swap_values) if max(swap_values) > 0 else 1.0
-    min_power = min(power_values) if min(power_values) > 0 else 0.1
-    avg_power = sum(power_values) / len(power_values)
-    
-    for sol in pareto_front:
-        # 构建模型计算复杂度
-        model = search_space.build_model(sol["op_codes"], sol["width_codes"])
-        params_mb = count_parameters_in_MB(model)
-        
-        # 计算结构平衡性
-        op_counts = {}
-        for op in sol["op_codes"]:
-            op_name = search_space.op_list[op]
-            op_counts[op_name] = op_counts.get(op_name, 0) + 1
-            
-        op_diversity = len(set(sol["op_codes"])) / len(search_space.op_list)
-        
-        # SWAP归一化（越高越好）
-        norm_swap = sol["fitness_values"][0] / max_swap
-        
-        # 功耗归一化（越低越好）
-        norm_power = min_power / sol["fitness_values"][1] if sol["fitness_values"][1] > 0 else 0
-        
-        # 复杂度评分（偏好中等大小的模型）
-        if params_mb < 1.0:
-            complexity_score = params_mb / 1.0  # 对过小的模型有惩罚
-        elif params_mb <= 4.0:
-            complexity_score = 1.0  # 1-4MB范围为最佳
-        else:
-            complexity_score = 1.0 - min(0.5, (params_mb - 4.0) * 0.1)  # 大模型惩罚
-            
-        # 操作多样性奖励
-        diversity_factor = 0.2 + 0.8 * op_diversity  # 0.2-1.0范围的因子
-        
-        # 根据权重计算综合评分
-        combined_score = (
-            swap_weight * norm_swap * diversity_factor + 
-            power_weight * norm_power + 
-            complexity_weight * complexity_score
-        )
-        
-        candidates.append({
-            "solution": sol,
-            "score": combined_score,
-            "swap": sol["fitness_values"][0],
-            "power": sol["fitness_values"][1],
-            "params": params_mb,
-            "diversity": op_diversity
-        })
-    
-    # 选择综合评分最高的解
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best_candidate = candidates[0]
-    
-    # 输出选择结果
-    logging.info(f"从 {len(pareto_front)} 个帕累托解中选择最佳架构:")
-    logging.info(f"  SWAP: {best_candidate['swap']:.3f}, 功耗: {best_candidate['power']:.3f} mJ")
-    logging.info(f"  参数量: {best_candidate['params']:.2f} MB, 多样性: {best_candidate['diversity']:.3f}")
-    logging.info(f"  综合评分: {best_candidate['score']:.3f}")
-    
-    return best_candidate["solution"]
 
 
 if __name__ == "__main__":

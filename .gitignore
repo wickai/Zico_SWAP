@@ -112,3 +112,9 @@ save_dir/
 
 # data
 **/data/
+
+# logs
+**/logs/
+
+# .vscode/
+.vscode
