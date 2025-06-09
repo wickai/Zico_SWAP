@@ -193,7 +193,7 @@ def setup_logger(log_path):
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.FileHandler(os.path.join(
-                log_path, "train_small_decay.log"), mode="w"),
+                log_path, "train.log"), mode="w"),
             logging.StreamHandler(sys.stdout)
         ]
     )
@@ -219,7 +219,7 @@ def main():
     args = parser.parse_args()
 
     # 根据数据集名称创建日志目录
-    log_path = os.path.join(args.log_path, f"base_cifar10")
+    log_path = os.path.join(args.log_path, f"base_cifar100")
     setup_logger(log_path)
     logging.info(args)
 
@@ -242,10 +242,11 @@ def main():
                              [0.2470, 0.2435, 0.2616]),
     ])
 
-    # 加载CIFAR10数据集
-    train_dataset = datasets.CIFAR10(
+    # 加载CIFAR100数据集
+    num_classes = 100
+    train_dataset = datasets.CIFAR100(
         root='./data', train=True, download=True, transform=transform_train)
-    test_dataset = datasets.CIFAR10(
+    test_dataset = datasets.CIFAR100(
         root='./data', train=False, transform=transform_test)
 
     train_loader = torch.utils.data.DataLoader(
@@ -289,7 +290,7 @@ def main():
         [6, 320, 1, 1],
     ]
 
-    model = mobilenet_v2(num_classes=10, width_mult=1.0, input_size=32,
+    model = mobilenet_v2(num_classes=num_classes, width_mult=1.0, input_size=32,
                          inverted_residual_setting=inverted_residual_setting)
 
     # 训练模型
