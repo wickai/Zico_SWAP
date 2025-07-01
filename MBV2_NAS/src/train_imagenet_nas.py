@@ -2,12 +2,14 @@ import argparse
 import torch
 import torch.optim as optim
 from torchvision import datasets, transforms
-from mobilenetv2 import mobilenet_v2
+# from mobilenetv2 import mobilenet_v2
+from tools.mbv2_searchspace import MobileNetSearchSpace
 import torch.nn as nn
 import numpy as np
 import os
 import sys
 import PIL
+from datetime import datetime
 
 import logging
 # logging.basicConfig(level=logging.INFO)
@@ -199,13 +201,21 @@ def setup_logger(log_path):
         log_path: 日志文件保存路径
     """
     os.makedirs(log_path, exist_ok=True)
+    # 清除已有的 handler
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
+    # 获取当前日期和时间，格式为 YYMMDD_HH_MM
+    timestamp = datetime.now().strftime("%y%m%d_%H_%M")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s INFO: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.FileHandler(os.path.join(
-                log_path, "train.log"), mode="w"),
+                log_path, f"train_{timestamp}.log"), mode="w"),
             logging.StreamHandler(sys.stdout)
         ]
     )
@@ -215,19 +225,27 @@ def main():
 
     parser = argparse.ArgumentParser(
         description='Train MobileNetV2 on Imagenet')
-    parser.add_argument('--batch-size', type=int, default=256,
+    parser.add_argument('--batch-size', type=int, default=128,
                         help='input batch size for training')
-    parser.add_argument('--epochs', type=int, default=150,
+    parser.add_argument('--epochs', type=int, default=200,
                         help='number of epochs to train')
-    parser.add_argument('--lr', type=float, default=0.05,
+    parser.add_argument('--lr', type=float, default=0.025,
                         help='learning rate')
     parser.add_argument('--weight_decay', type=float,
                         default=4e-5, help='weight decay')
     parser.add_argument('--no-cuda', action='store_true',
                         default=False, help='disables CUDA training')
     parser.add_argument('--seed', type=int, default=1, help='random seed')
-    parser.add_argument("--log_path", default="./logs/imagenet_mbv2",
+    parser.add_argument("--log_path", default="./logs/imagenet_mbv2_nas",
                         type=str, help="where to save logs")
+    parser.add_argument("--cutout_length", default=16,
+                        type=int, help="cutout length")
+
+    # mixup & label smoothing
+    parser.add_argument("--mixup_alpha", default=0.1, type=float,
+                        help="mixup alpha, if 0 then no mixup")
+    parser.add_argument("--label_smoothing", default=0.1,
+                        type=float, help="label smoothing factor")
 
     args = parser.parse_args()
 
@@ -278,15 +296,24 @@ def main():
     )
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8)
     test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=100, shuffle=False, num_workers=4)
+        test_dataset, batch_size=100, shuffle=False, num_workers=8)
 
     # Default setting
     # inverted_residual_setting = None
 
-    model = mobilenet_v2(num_classes=num_classes, width_mult=1.0, input_size=224,
-                         inverted_residual_setting=None)
+    # model = mobilenet_v2(num_classes=num_classes, width_mult=1.0, input_size=224,
+    #                      inverted_residual_setting=None)
+
+    search_space = MobileNetSearchSpace(
+        num_classes=1000,
+        small_input=False
+    )
+    best_individual = {'op_codes': [
+        7, 7, 10, 6, 7, 6, 6, 10, 5, 3, 3, 3, 2, 10, 7, 10, 2], 'width_codes': [1, 1, 1, 1, 1, 0, 1]}
+    model = search_space.get_model(
+        best_individual["op_codes"], best_individual["width_codes"])
 
     # 训练模型
     final_top1, final_top5 = train_and_eval(
@@ -296,8 +323,8 @@ def main():
         device=device,
         epochs=args.epochs,
         lr=args.lr,
-        mixup_alpha=-1,
-        label_smoothing=0.1,
+        mixup_alpha=args.mixup_alpha,
+        label_smoothing=args.label_smoothing,
         weight_decay=args.weight_decay
     )
 
@@ -305,9 +332,9 @@ def main():
     torch.save({
         'state_dict': model.state_dict(),
         'top1_acc': final_top1
-    }, os.path.join(log_path, f"mbv2_imagenet.pth"))
+    }, os.path.join(log_path, f"mbv2_nas_imagenet.pth"))
     logging.info(
-        f"模型已保存到 {os.path.join(log_path, f'mbv2_imagenet.pth')}")
+        f"模型已保存到 {os.path.join(log_path, f'mbv2_nas_imagenet.pth')}")
 
 
 if __name__ == '__main__':

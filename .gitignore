@@ -118,3 +118,10 @@ save_dir/
 
 # .vscode/
 .vscode
+
+# uv_cache
+**/.uv_cache
+uv.lock
+
+# notebooks
+**/notebooks/

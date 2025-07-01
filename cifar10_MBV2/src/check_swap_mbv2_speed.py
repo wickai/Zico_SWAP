@@ -38,7 +38,10 @@ class SampleWiseActivationPatterns:
         # 转置后 unique(dim=0)
         self.activations = self.activations.t()  # => (features, N)
         unique_patterns = torch.unique(self.activations, dim=0).size(0)
-        return unique_patterns/self.activations.size(0) * 100  # * reg_factor
+        # del self.activations
+        # /self.activations.size(0) * 100  # * reg_factor
+        # /self.activations.size(0) * 100  # * reg_factor
+        return unique_patterns
 
 
 ##
@@ -82,7 +85,7 @@ def set_inplace_false(model: nn.Module):
 
 def _make_hook(name):
     def _hook_fn(module, inp, out):
-        print(f"[{name}] grad_fn: {out.grad_fn}")
+        # print(f"[{name}] grad_fn: {out.grad_fn}")
         out.retain_grad()
         inter_feats.append(out)
         if torch.isnan(out).any():
@@ -123,9 +126,14 @@ def main():
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-
+    s_time = time.time()
     model = mobilenet_v2(num_classes=10, width_mult=1.0, input_size=32,
                          inverted_residual_setting=None)
+
+    print("model:", model)
+    param_size_mb = sum(p.numel()
+                        for p in model.parameters() if p.requires_grad) / 1e6
+    print("[*]param_size_mb", param_size_mb)
     # model = MyNet()
 
     hooks = []
@@ -134,8 +142,8 @@ def main():
             # h = module.register_forward_hook(_hook_fn)
             h = module.register_forward_hook(_make_hook(name))
             hooks.append(h)
-        if isinstance(module, (nn.ReLU, nn.ReLU6)):
-            print(f"{name} inplace={module.inplace}")
+        # if isinstance(module, (nn.ReLU, nn.ReLU6)):
+        #     print(f"{name} inplace={module.inplace}")
 
     device = torch.device("cuda" if not args.no_cuda else "cpu")
 
@@ -146,9 +154,11 @@ def main():
     inputs = next(iter(train_loader))[0].to(device)
     # with torch.no_grad():
     # lossfunc = nn.CrossEntropyLoss().cuda()
+    print("[*]Model prepare time", time.time() - s_time)
 
     swap_evaluator = SampleWiseActivationPatterns(device)
     with torch.autograd.detect_anomaly():
+        s_time = time.time()
         model(inputs)
         print("global #inter_feats", len(inter_feats))
         print("global inter_feats[0].shape", inter_feats[0].shape)
@@ -160,22 +170,28 @@ def main():
         #                                               batch_size=args.batch_size,
         #                                               layer_features=inter_feats)
         reg_factor = 1.0
-        inter_feats = [fea.detach().reshape(fea.size(0), -1)
+        inter_feats = [fea.detach().reshape(fea.size(0), -1)  # [-, 5120]
                        for fea in inter_feats]
+        print([fea.size()   # [-, 5120]
+               for fea in inter_feats])
         all_feats = torch.cat(inter_feats, dim=1)  # (N, sum_of_features)
         print("all_feats.shape", all_feats.shape)
+        print("[*]model inference& concant time", time.time() - s_time)
+
         s_time = time.time()
         swap_evaluator.collect_activations(all_feats)
         total_swap_score = swap_evaluator.calc_swap(reg_factor)
-        print("time:", time.time() - s_time)
+        print("[*] Big feature swap calculation time:", time.time() - s_time)
 
         s_time = time.time()
         swap_score_list = []
         for fea in inter_feats:
-            swap_evaluator.collect_activations(fea)
+            swap_evaluator.collect_activations(
+                fea.view(inputs.size(0), -1))
             swap_score = swap_evaluator.calc_swap(reg_factor)
             swap_score_list.append(swap_score)
-        print("seperate time:", time.time() - s_time)
+        print("[*] Sum of seperate feature swap calculation time:",
+              time.time() - s_time)
         #
 
     print('total_swap_score', total_swap_score)
