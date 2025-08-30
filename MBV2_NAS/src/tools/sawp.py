@@ -2,6 +2,7 @@ import math
 import pandas as pd
 import torch
 import torch.nn as nn
+from .evaluation import get_model_complexity_info, count_parameters_in_MB
 
 # ============ 4) SWAP评估相关 ============
 
@@ -14,12 +15,15 @@ def cal_regular_factor(model, mu, sigma):
     """
     param_mb = count_parameters_in_MB(model)
     param_kb = param_mb * 1e3
-    print("param_mb, mu, sigma =", param_mb, mu, sigma)
+    
 
     # 建议引入 2.0 以更符合高斯分布
     # val = -((param_kb - mu) ** 2) / (2.0 * (sigma ** 2))
     val = -((param_kb - mu) ** 2) / sigma
-    return math.exp(val)
+    
+    print("param_mb, mu, sigma =", param_mb, mu, sigma)
+    ratio = math.exp(val)
+    return ratio
 
 
 class SampleWiseActivationPatterns:
@@ -47,7 +51,8 @@ class SampleWiseActivationPatterns:
         unique_patterns = torch.unique(self.activations, dim=0).size(0)
         # print("unique_patterns * reg_factor:", unique_patterns, reg_factor)
         # / self.activations.size(0) * 100  # * reg_factor
-        return unique_patterns  # / self.activations.size(0) * 100
+        # return unique_patterns  # / self.activations.size(0) * 100
+        return unique_patterns * reg_factor
 
 
 class SWAP:
@@ -115,11 +120,14 @@ def calculate_mu_sigma(search_space, n_samples=1000):
     这里我们取中位数做 mu，标准差做 sigma
     """
     arr = []
+    dummuy_input = torch.randn(1, 3, 224, 224)
     for _ in range(n_samples):
         op_codes = search_space.random_op_codes()
         width_codes = search_space.random_width_codes()
         model = search_space.get_model(op_codes, width_codes)
-        param_mb = count_parameters_in_MB(model)
+        model_info = get_model_complexity_info(model, dummuy_input)
+        # param_mb = count_parameters_in_MB(model)
+        param_mb = model_info['params'] / 1e6
         param_kb = param_mb * 1e3
         arr.append(param_kb)
 
