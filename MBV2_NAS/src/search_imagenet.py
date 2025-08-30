@@ -11,13 +11,15 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 
-from tools.evaluation import set_seed, count_parameters_in_MB
+from tools.evaluation import set_seed, count_parameters_in_MB, get_model_complexity_info
 from tools.mbv2_searchspace import MobileNetSearchSpace
-from tools.sawp import SWAP
+from tools.sawp import SWAP, calculate_mu_sigma
 from tools.es import EvolutionarySearch
 from tools.loader import get_cifar10_dataloaders
 from tools.trainer import train_and_eval
 import PIL
+
+from datasets import load_dataset, load_from_disk
 
 
 def parse_args():
@@ -107,6 +109,51 @@ def setup_logger(log_path):
     )
 
 
+def load_imagenet_dataset(split: str):
+    if split == 'validation':
+        split = 'val'
+    local_path = os.path.join("/data/wk/kai/data/imagenet_arrow", split)
+    print("local_path", local_path)
+    if os.path.exists(local_path):
+        print(f"[✓] 使用本地数据集: {local_path}")
+        hf_dataset = load_from_disk(local_path)
+    else:
+        print("[⭳] 本地数据集不存在，正在从 Hugging Face Hub 加载...")
+        # hf_dataset = load_dataset("imagenet-1k", split=split)
+        pass
+    
+    return hf_dataset
+
+from torch.utils.data import Dataset
+import numpy as np
+from PIL import Image
+
+class HFDatasetWrapper(Dataset):
+    def __init__(self, hf_dataset, transform=None):
+        self.dataset = hf_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        example = self.dataset[idx]
+        image = example["image"]
+
+        if isinstance(image, list):
+            image = np.array(image)
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(image)
+        print(image.size, image.mode)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+
+        label = example.get("label", -1)  # 如果没有 label，可返回 -1 或忽略
+        
+        return image, label
+
 def main():
     args = parse_args()
     setup_logger(args.log_path)
@@ -159,19 +206,21 @@ def main():
         transforms.Normalize(mean, std),
     ])
     # ImageNet需要指定文件夹路径
-    root = '/home/ubuntu/scratch/kaiwei/unzip_imagenet/ILSVRC/Data/CLS-LOC/'
-    train_ds = datasets.ImageFolder(
-        os.path.join(root, 'train'),
-        transform=transform_train
-    )
-
+    # root = '/home/ubuntu/scratch/kaiwei/unzip_imagenet/ILSVRC/Data/CLS-LOC/'
+    # train_ds = datasets.ImageFolder(
+    #     os.path.join(root, 'train'),
+    #     transform=transform_train
+    # )
+    hf_dataset = load_imagenet_dataset('train')
+    train_ds = HFDatasetWrapper(hf_dataset, transform=transform_train)
     search_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=args.search_batch, shuffle=True, num_workers=8
+        train_ds, batch_size=args.search_batch, shuffle=True, num_workers=4
     )
     mini_inputs, _ = next(iter(search_loader))
     mini_inputs = mini_inputs.to(device)
 
     # 4) 构建 SWAP 指标
+    print(f"[*] args.use_param_regular, {args.use_param_regular}")
     swap_metric = SWAP(
         device=device, regular=args.use_param_regular, mu=mu, sigma=sigma)
 
@@ -186,7 +235,7 @@ def main():
         num_inits=args.num_inits
     )
     start = time.time()
-    best_individual = es.search(mini_inputs)
+    best_individual, population  = es.search(mini_inputs)
     end = time.time()
 
     logging.info(f"Search finished in {end - start:.2f}s.")
@@ -196,14 +245,25 @@ def main():
     # 6) 构造最优模型 & 最终训练
     best_model = search_space.get_model(
         best_individual["op_codes"], best_individual["width_codes"])
-    param_mb = count_parameters_in_MB(best_model)
-    logging.info(f"Best Model param: {param_mb:.2f} MB")
+    # param_mb = count_parameters_in_MB(best_model)
+    # logging.info(f"Best Model param: {param_mb:.2f} MB")
+    dummy_input = torch.randn(1,3,224,224)
+    model_info = get_model_complexity_info(best_model, dummy_input)
+    logging.info(f"Best Model param: {model_info['params']/1e6:.2f} MB, flops: {model_info['flops']/1e6:.2f} MFLOPs")
     logging.info(
         f"Parameters: lr={args.lr}, train_batch={args.train_batch}, train_epochs={args.train_epochs}, mixup_alpha={args.mixup_alpha}, label_smoothing={args.label_smoothing}")
     logging.info(
         f"Best architecture | SWAP fitness={best_individual['fitness']:.3f}")
     logging.info(
         f"Best architecture | op_codes={best_individual['op_codes']}, width_codes={best_individual['width_codes']}")
+    
+    for i, p in enumerate(population):
+        logging.info(f"[{i} item] ============================")
+        for k, v in p.items():
+            logging.info(f"{k}:{v}")
+        logging.info("")
+        
+        
 
 
 if __name__ == "__main__":

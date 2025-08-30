@@ -3,17 +3,21 @@ name = "zico-swap"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
+    "datasets>=3.6.0",
+    "fvcore>=0.1.5.post20221221",
     "gdown>=5.2.0",
     "ipykernel>=6.29.5",
     "matplotlib>=3.10.3",
     "numpy>=2.3.0",
     "pandas>=2.3.0",
     "pillow>=11.2.1",
+    "ptflops>=0.7.4",
     "pyjoules[nvidia]>=0.5.1",
     "scipy>=1.15.3",
     "torch>=2.7.1",
+    "torchprofile>=0.0.4",
     "torchvision>=0.22.1",
     "tqdm>=4.67.1",
 ]
@@ -21,4 +25,15 @@ dependencies = [
 exclude = ["*.ipynb"]
 
 [tool.uv]
-cache-dir = "./.uv_cache"
+cache-dir = "/data/wk/kai/github/pymetric-1/.uv_cache"
+
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
