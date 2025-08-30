@@ -4,8 +4,15 @@
 mkdir -p logs/gridsearch
 
 # 定义超参数列表
-generations_list=(300)
-population_list=(40 60 80)
+generations_list=(200 300)
+population_list=(20 40 60 80)
+
+# size 
+# 468 for 450m
+# 625 for 600m
+max_flops_cnn=468
+export max_flops_cnn
+echo "Max model size: $max_flops_cnn MFLOPs"
 
 # Python 脚本路径
 SCRIPT="src/search_imagenet.py"
@@ -38,6 +45,7 @@ run_task() {
         --device cuda \
         --num_classes 1000 \
         --log_path logs/gridsearch \
+        --max_flops_cnn "$max_flops_cnn"\
         > "$LOGFILE" 2>&1
 
     fitness=$(grep "SWAP fitness=" "$LOGFILE" | tail -1 | sed 's/.*SWAP fitness=\([0-9.]*\).*/\1/')

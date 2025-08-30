@@ -17,7 +17,7 @@ class EvolutionarySearch:
 
     def __init__(self, population_size, mutation_rate, n_generations,
                  swap_metric, search_space, device,
-                 num_inits=3):
+                 num_inits=3, max_flops_cnn=625):
         """
         :param num_inits: 对同一个结构多次随机初始化并计算SWAP平均，以减少初始化差异
         """
@@ -29,6 +29,7 @@ class EvolutionarySearch:
         self.device = device
         self.num_inits = num_inits
         self.dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
+        self.max_flops_cnn=max_flops_cnn
 
     def search(self, inputs):
         # 1) 初始化种群
@@ -120,8 +121,8 @@ class EvolutionarySearch:
                         ).to(self.device)
                 model_info = get_model_complexity_info_fvcore(model, self.dummy_input)
                 flops_cnn = model_info['flops_cnn'] / 1e6
-                if flops_cnn > 625:
-                    logging.info(f"[****] flops_cnn: {flops_cnn:.3f}MFLOPs greater than 600, skip~~")
+                if flops_cnn > self.max_flops_cnn:
+                    logging.info(f"[****] flops_cnn: {flops_cnn:.3f}MFLOPs greater than {self.max_flops_cnn:.3f}MFLOPs, skip~~")
                     continue
                 del model
                 next_gen.append({

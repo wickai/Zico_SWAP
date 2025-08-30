@@ -77,6 +77,9 @@ def parse_args():
                         type=float, help="label smoothing factor")
     parser.add_argument("--weight_decay", default=5e-4,
                         type=float, help="weight decay")
+    #max_flops_cnn
+    parser.add_argument("--max_flops_cnn", default=625,
+                        type=float, help="max model size of CNN params in MFLOPs")
 
     args = parser.parse_args()
     return args
@@ -232,7 +235,8 @@ def main():
         swap_metric=swap_metric,
         search_space=search_space,
         device=device,
-        num_inits=args.num_inits
+        num_inits=args.num_inits,
+        max_flops_cnn=args.max_flops_cnn
     )
     start = time.time()
     best_individual, population  = es.search(mini_inputs)
