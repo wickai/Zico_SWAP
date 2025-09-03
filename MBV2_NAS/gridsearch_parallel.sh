@@ -4,13 +4,13 @@
 mkdir -p logs/gridsearch
 
 # 定义超参数列表
-generations_list=(200 300)
+generations_list=(300)
 population_list=(20 40 60 80)
 
 # size 
 # 468 for 450m
 # 625 for 600m
-max_flops_cnn=468
+max_flops_cnn=625
 export max_flops_cnn
 echo "Max model size: $max_flops_cnn MFLOPs"
 
