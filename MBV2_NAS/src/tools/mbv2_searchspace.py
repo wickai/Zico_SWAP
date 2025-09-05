@@ -160,7 +160,7 @@ class MobileNetSearchSpace:
         [6, 160, 5, 2], #+2
         [6, 320, 2, 1], #+1
     ]
-    _WIDTH_CHOICES = [1.2] # flops drops
+    _WIDTH_CHOICES = [1.0] # flops drops
     # 25 layers 450 flops human design (base from 21-layer)
     # _STAGE_SETTING = [
     #     # t, c, n, s

@@ -10,7 +10,7 @@ population_list=(20 40 60 80)
 # size 
 # 468 for 450m
 # 625 for 600m
-max_flops_cnn=625
+max_flops_cnn=468
 export max_flops_cnn
 echo "Max model size: $max_flops_cnn MFLOPs"
 
